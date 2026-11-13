@@ -24,7 +24,7 @@ fn fixture(version: u32, revision: u32) -> Vec<u8> {
     let so = h + 3; // Deliberately unaligned sections with gaps.
     let ro = so + 2 * s + 7;
     let mut b = vec![0; ro + 2 * r];
-    b[..4].copy_from_slice(&[0x53, 0x69, 0x57, 0x48]);
+    b[..4].copy_from_slice(b"HWiS");
     put32(&mut b, 4, version);
     put32(&mut b, 8, revision);
     b[12..20].copy_from_slice(&(-1234567i64).to_le_bytes());
@@ -88,19 +88,21 @@ fn documented_layouts_and_unaligned_little_endian_fields() {
     }
 }
 #[test]
-fn signature_is_numeric_not_ascii_and_inactive_never_accepted() {
+fn signature_requires_exact_wire_bytes_and_rejects_old_literal_and_inactive() {
     for signature in [
         0,
         0x44454144,
         0x44414544,
-        u32::from_le_bytes(*b"HWiS"),
+        0x48576953, // Previously accepted C literal; wire bytes SiWH are invalid.
         u32::MAX,
     ] {
         let mut b = fixture(2, 1);
         put32(&mut b, 0, signature);
         assert_eq!(decode(&b), Err(DecodeError::Signature(signature)));
     }
-    assert_eq!(ACTIVE_SIGNATURE, 0x48576953);
+    assert_eq!(ACTIVE_SIGNATURE, 0x53695748);
+    assert_eq!(ACTIVE_SIGNATURE.to_le_bytes(), *b"HWiS");
+    assert!(decode(&fixture(2, 1)).is_ok());
 }
 #[test]
 fn unknown_versions_and_revisions_rejected() {
@@ -407,7 +409,7 @@ fn deterministic_mutation_and_random_corpus_never_panics() {
             *byte = (seed >> 32) as u8;
         }
         if b.len() >= 12 && n % 2 == 0 {
-            put32(&mut b, 0, 0x48576953);
+            b[..4].copy_from_slice(b"HWiS");
             put32(&mut b, 4, 2);
             put32(&mut b, 8, 1);
         }

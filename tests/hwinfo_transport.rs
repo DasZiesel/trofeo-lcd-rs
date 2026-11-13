@@ -128,7 +128,7 @@ impl Drop for Fixture {
 fn header(time: i64) -> Vec<u8> {
     let mut data = vec![0u8; 48];
     for (at, value) in [
-        (0, 0x48576953u32),
+        (0, u32::from_le_bytes(*b"HWiS")),
         (4, 2),
         (8, 1),
         (20, 48),
@@ -789,4 +789,19 @@ fn repeated_preflight_failures_release_all_resources() {
             panic!("mutex leak");
         }
     }
+}
+
+#[test]
+fn transport_rejects_old_signature_and_accepts_only_hwis_wire_bytes() {
+    assert_eq!(
+        rejected_header(&[(0, 0x48576953)]),
+        TransportError::Header(DecodeError::Signature(0x48576953))
+    );
+    let f = Fixture::new(4096);
+    let mut data = header(0);
+    data[..4].copy_from_slice(&[0x48, 0x57, 0x69, 0x53]);
+    f.write(&data);
+    let copy = capture(&f);
+    assert_eq!(&copy.bytes()[..4], b"HWiS");
+    assert_eq!(copy.decode().unwrap().status(), Status::Unverified);
 }

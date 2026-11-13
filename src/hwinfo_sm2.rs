@@ -5,9 +5,9 @@
 use crate::sensor_policy::{HwinfoSelector, Source, Status};
 use std::{collections::HashSet, fmt, ops::Range};
 
-/// Windows DWORD representation of the C multi-character constant 'HWiS'.
-/// Little-endian bytes are 53 69 57 48, not the ASCII string "HWiS".
-pub const ACTIVE_SIGNATURE: u32 = 0x4857_6953;
+/// Active wire bytes are ASCII `HWiS` (48 57 69 53).
+/// Interpret those bytes as little endian, not as a C multi-character literal.
+pub const ACTIVE_SIGNATURE: u32 = u32::from_le_bytes(*b"HWiS");
 // Application resource limits, not limits promised by HWiNFO.
 pub const MAX_BUFFER_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_SENSORS: u32 = 4096;
