@@ -540,3 +540,24 @@ language = en
 # ticker_source and ticker_refresh_min require a restart. weather_unit, the "weather"
 # show/hide/size/position/color/backdrop options, and ticker_position/ticker_size/
 # ticker_color/ticker_backdrop/ticker_width all apply live, like everything else.
+
+# --- Sensor source and stable role assignments (restart required) ---
+# Default auto preserves native/LHM acquisition and does not start HWiNFO.
+# HWiNFO requires a separately running Windows x64 HWiNFO with Shared Memory enabled.
+# Use the editor's explicit inventory button to choose compatible sensors.
+# The IDs below are synthetic examples; replace them with your own selected IDs.
+# Names are not bindings. A missing/invalid/stale binding never falls back.
+# Display eligibility uses global publisher progress; individual reading freshness
+# remains unverified. The status footer distinguishes missing/invalid/stale data.
+# sensor_source = auto
+# Choices: auto, native, lhm, hwinfo, bridge (bridge unavailable in this build).
+# sensor_cpu_temp = hwinfo:0x00000001/0x00000000/0x00000001
+# sensor_cpu_fan = hwinfo:0x00000001/0x00000000/0x00000002
+# sensor_case_fan = hwinfo:0x00000001/0x00000000/0x00000003
+# sensor_pump = hwinfo:0x00000001/0x00000000/0x00000004
+# sensor_mb_temp = hwinfo:0x00000001/0x00000000/0x00000005
+# sensor_gpu_temp = native:gpu_temp
+# Without an explicit GPU binding, native GPU priority remains unchanged.
+# Reserved bridge configuration (no IPC client in this build):
+# bridge_mode = mock
+# bridge_service = TrofeoSensorService

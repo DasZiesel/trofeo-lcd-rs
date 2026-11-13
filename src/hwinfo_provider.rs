@@ -24,6 +24,26 @@ pub struct Entry {
     pub current: f64,
     pub numeric_status: Status,
 }
+impl Entry {
+    pub fn compatibility(&self, role: Role) -> Result<(), Diagnostic> {
+        let expected = if role.unit() == Unit::Celsius {
+            ReadingType::Temperature
+        } else {
+            ReadingType::Fan
+        };
+        if self.reading_type != expected {
+            return Err(Diagnostic::TypeMismatch);
+        }
+        let unit_ok = match role.unit() {
+            Unit::Celsius => matches!(self.unit.as_str(), "°C" | "C"),
+            Unit::Rpm => self.unit == "RPM",
+        };
+        if !unit_ok {
+            return Err(Diagnostic::UnitMismatch);
+        }
+        Ok(())
+    }
+}
 #[derive(Clone, Debug)]
 pub struct Frame {
     pub poll_time_raw: i64,
@@ -272,20 +292,8 @@ impl State {
         let Some(entry) = frame.entries.iter().find(|r| r.identity == id) else {
             return result(Status::NotFound, Diagnostic::Missing);
         };
-        let expected = if role.unit() == Unit::Celsius {
-            ReadingType::Temperature
-        } else {
-            ReadingType::Fan
-        };
-        if entry.reading_type != expected {
-            return result(Status::Invalid, Diagnostic::TypeMismatch);
-        }
-        let unit_ok = match role.unit() {
-            Unit::Celsius => matches!(entry.unit.as_str(), "°C" | "C"),
-            Unit::Rpm => entry.unit == "RPM",
-        };
-        if !unit_ok {
-            return result(Status::Invalid, Diagnostic::UnitMismatch);
+        if let Err(diagnostic) = entry.compatibility(role) {
+            return result(Status::Invalid, diagnostic);
         }
         let range_ok = match role.unit() {
             Unit::Celsius => (-273.15..=1000.0).contains(&entry.current),
@@ -296,7 +304,12 @@ impl State {
         }
         match self.snapshot_status(now) {
             Status::Stale => result(Status::Stale, Diagnostic::PublisherStale),
-            Status::Ok => result(Status::Unverified, Diagnostic::ReadingUnverified),
+            // Ok is display eligibility based on global publisher progress only.
+            // Diagnostic preserves the lack of independent per-reading evidence.
+            Status::Ok => Resolution {
+                sample: Sample::new(Source::Hwinfo, role, Some(entry.current), Status::Ok),
+                diagnostic: Diagnostic::ReadingUnverified,
+            },
             _ => result(Status::Unverified, Diagnostic::PublisherUnverified),
         }
     }

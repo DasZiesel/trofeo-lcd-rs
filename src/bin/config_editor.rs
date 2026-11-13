@@ -1205,6 +1205,8 @@ struct App {
     frames: u32,
     shot_requested: bool,
     lcd_test: LcdTest,
+    hwinfo_worker: Option<trofeo_lcd::hwinfo_provider::Worker>,
+    hwinfo_search: String,
 }
 
 fn default_path() -> PathBuf {
@@ -1238,6 +1240,8 @@ impl App {
             frames: 0,
             shot_requested: false,
             lcd_test: LcdTest::new(),
+            hwinfo_worker: None,
+            hwinfo_search: String::new(),
         };
         app.load(&path);
         app
@@ -1526,6 +1530,57 @@ impl App {
         ui.label(RichText::new(tr(l, "(n) = settings you changed", "(n) = impostazioni che hai cambiato")).weak().small());
     }
 
+    fn hwinfo_picker(&mut self, ui: &mut egui::Ui) {
+        use trofeo_lcd::{hwinfo_provider::Worker, sensor_policy::{ROLES, KEYS}, sensor_display};
+        ui.collapsing("HWiNFO sensor assignments (restart required)", |ui| {
+            ui.label("Reads HWiNFO Shared Memory only when started here. Names stay in memory; saved bindings contain IDs only.");
+            ui.label("Display values require publisher progress. Individual reading freshness is unverified.");
+            if self.hwinfo_worker.is_some() {
+                if ui.button("Stop inventory reading").clicked() { self.hwinfo_worker = None; }
+            } else if ui.button("Read HWiNFO inventory").clicked() {
+                #[cfg(all(windows, target_pointer_width = "64"))]
+                match Worker::start(Default::default()) {
+                    Ok(w) => self.hwinfo_worker = Some(w),
+                    Err(e) => self.say(format!("HWiNFO unavailable: {e:?}"), true),
+                }
+                #[cfg(not(all(windows, target_pointer_width = "64")))]
+                self.say("HWiNFO requires Windows x64", true);
+            }
+            let view = self.hwinfo_worker.as_ref().and_then(|w| w.view());
+            let Some(view) = view else { ui.label("Inventory stopped or busy. Existing bindings are retained; manual IDs remain editable below."); return; };
+            ui.ctx().request_repaint_after(Duration::from_millis(500));
+            ui.label(format!("Publisher: {:?}; {:?}", view.state.snapshot_status(view.now), view.state.failure));
+            let Some(frame) = &view.state.frame else { return };
+            ui.label("Search names or IDs (up to 200 matches per role):");
+            ui.text_edit_singleline(&mut self.hwinfo_search);
+            let search = self.hwinfo_search.to_lowercase();
+            for role in ROLES {
+                let key = KEYS[role.index()];
+                let current = self.ed.get(key).unwrap_or_default();
+                let selected = frame.entries.iter().find(|e| e.identity.to_string() == current)
+                    .map(|e| format!("{} / {} — {}", e.sensor_name, e.label, current))
+                    .unwrap_or_else(|| if current.is_empty() { "Not assigned (source default)".into() } else { current.clone() });
+                ui.label(format!("{} (compatible type/unit only)", &key[7..]));
+                if let Ok(id) = current.parse::<trofeo_lcd::sensor_policy::HwinfoSelector>() {
+                    let resolved = view.resolve(role, id);
+                    ui.label(format!("Display: {:?}; {:?}", resolved.sample.status, resolved.diagnostic));
+                }
+                egui::ComboBox::from_id_salt(("hwinfo_picker", key)).selected_text(selected).show_ui(ui, |ui| {
+                    if ui.selectable_label(current.is_empty(), "Use source default").clicked() { self.ed.unset(key); self.ed.bufs.remove(key); }
+                    for entry in frame.entries.iter().filter(|e| sensor_display::compatible(e, role))
+                        .filter(|e| search.is_empty() || format!("{} {} {}", e.sensor_name, e.label, e.identity).to_lowercase().contains(&search)).take(200) {
+                        let title = format!("{} / {} [{}] — {}", entry.sensor_name, entry.label, entry.unit, entry.identity);
+                        if ui.selectable_label(current == entry.identity.to_string(), title).clicked() {
+                            match sensor_display::select(&self.ed.doc, &view, role, entry.identity) {
+                                Ok(doc) => { self.ed.doc = doc; self.ed.bufs.remove(key); self.ed.rev += 1; },
+                                Err(e) => self.say(e, true),
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    }
     fn form(&mut self, ui: &mut egui::Ui) {
         let l = self.lang;
         if self.section == "raw" {
@@ -1587,6 +1642,7 @@ impl App {
         let exe = self.preview.exe.clone();
         let workdir = self.path.parent().map(Path::to_path_buf).unwrap_or_default();
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            if self.section == "lhm" { self.hwinfo_picker(ui); }
             let mut last_group = "";
             for f in &fields {
                 if let Some((k, vals)) = f.when {

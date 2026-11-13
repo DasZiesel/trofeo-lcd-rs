@@ -50,8 +50,8 @@ fn progress_is_not_reading_quality_and_identical_snapshots_never_refresh() {
     s.update(Ok(frame(11)), sec(1));
     assert_eq!(s.snapshot_status(sec(1)), Status::Ok);
     let r = s.resolve(Role::CpuTemp, id(3), sec(1));
-    assert_eq!(r.sample.status, Status::Unverified);
-    assert_eq!(r.sample.value, None);
+    assert_eq!(r.sample.status, Status::Ok);
+    assert_eq!(r.sample.value, Some(42.));
     assert_eq!(r.diagnostic, Diagnostic::ReadingUnverified);
     let mut repeated = frame(11);
     repeated.entries[0].current = 99.;
@@ -374,4 +374,197 @@ fn owned_inventory_from_bytes_preserves_ids_utf8() {
     assert_eq!(f.entries[0].label, "Temp");
     assert_eq!(f.entries[0].unit, "°C");
     assert_eq!(f.entries[0].current, 42.5);
+}
+
+#[test]
+fn display_projection_expires_without_another_poll_and_recovers_conservatively() {
+    use trofeo_lcd::sensor_display::{display_text, Projection};
+    let settings =
+        validate_text("sensor_source=hwinfo\nsensor_cpu_temp=hwinfo:0x1/0x2/0x3").unwrap();
+    let mut s = state();
+    s.update(Ok(frame(1)), sec(0));
+    for (time, expected) in [(0, Status::Unverified)] {
+        let view = View {
+            state: Arc::new(s.clone()),
+            now: sec(time),
+        };
+        let p = Projection::new(&settings, Some(&view));
+        assert_eq!(p.samples[0].unwrap().status, expected);
+        assert!(display_text(&p.samples[0].unwrap()).contains("--"));
+    }
+    s.update(Ok(frame(2)), sec(1));
+    let view = View {
+        state: Arc::new(s.clone()),
+        now: sec(1),
+    };
+    let p = Projection::new(&settings, Some(&view));
+    assert_eq!(p.samples[0].unwrap().value, Some(42.));
+    assert!(display_text(&p.samples[0].unwrap()).contains("42.0 C"));
+    assert_eq!(p.samples[1].unwrap().status, Status::NotFound);
+    assert!(p.samples[5].is_none()); // native GPU is untouched
+    let expired = View {
+        state: view.state.clone(),
+        now: sec(6),
+    };
+    let p2 = Projection::new(&settings, Some(&expired));
+    assert_eq!(p2.samples[0].unwrap().status, Status::Stale);
+    assert_eq!(p2.samples[0].unwrap().value, None);
+    assert!(!p.history[0].unwrap().same_epoch(p2.history[0].unwrap()));
+    s.update(Err(Failure::Unavailable), sec(7));
+    assert_eq!(
+        Projection::new(
+            &settings,
+            Some(&View {
+                state: Arc::new(s.clone()),
+                now: sec(7)
+            })
+        )
+        .samples[0]
+            .unwrap()
+            .status,
+        Status::Unavailable
+    );
+    s.update(Ok(frame(3)), sec(8));
+    assert_eq!(
+        s.resolve(Role::CpuTemp, id(3), sec(8)).sample.status,
+        Status::Unverified
+    );
+    s.update(Ok(frame(4)), sec(9));
+    assert_eq!(
+        s.resolve(Role::CpuTemp, id(3), sec(9)).sample.value,
+        Some(42.)
+    );
+    assert_ne!(s.generation, view.state.generation);
+    for (w, h) in [(1920, 462), (480, 1280), (1280, 480)] {
+        let mut fb = trofeo_lcd::Framebuffer::new(trofeo_lcd::Resolution::new(w, h));
+        p.draw(&mut fb);
+        assert!(fb.as_bytes().iter().any(|&v| v != 0));
+        p2.draw(&mut fb);
+        assert!(display_text(&p2.samples[0].unwrap()).contains("Stale"));
+    }
+}
+
+#[test]
+fn editor_selection_preserves_unknowns_and_rejects_incompatible_stale_and_missing() {
+    use trofeo_lcd::{
+        conf_edit::ConfDoc,
+        sensor_display::{compatible, select},
+    };
+    let doc = ConfDoc::parse("# keep\nunknown_option=untouched\nsensor_source=hwinfo\n");
+    let mut s = state();
+    s.update(Ok(frame(1)), sec(0));
+    let view = View {
+        state: Arc::new(s.clone()),
+        now: sec(0),
+    };
+    let chosen = select(&doc, &view, Role::CpuTemp, id(3)).unwrap();
+    assert_eq!(chosen.get("sensor_cpu_temp"), Some(id(3).to_string()));
+    assert_eq!(chosen.get("unknown_option").as_deref(), Some("untouched"));
+    assert!(chosen.to_text().contains("# keep"));
+    assert!(!chosen.to_text().contains("Synthetic"));
+    assert_eq!(
+        validate_text(&chosen.to_text()).unwrap().roles[0],
+        trofeo_lcd::sensor_policy::Binding::Hwinfo(id(3))
+    );
+    assert!(select(&doc, &view, Role::CpuFan, id(3)).is_err());
+    assert!(select(&doc, &view, Role::CpuTemp, id(99)).is_err());
+    assert!(select(
+        &doc,
+        &View {
+            state: view.state,
+            now: sec(5)
+        },
+        Role::CpuTemp,
+        id(3)
+    )
+    .is_err());
+    let mut e = entry(3);
+    e.unit = "F".into();
+    assert!(!compatible(&e, Role::CpuTemp));
+    assert!(doc.get("sensor_cpu_temp").is_none());
+}
+
+#[test]
+fn display_invalid_missing_unavailable_and_identity_changes_never_keep_numbers() {
+    use trofeo_lcd::sensor_display::{display_text, Projection};
+    let settings =
+        validate_text("sensor_source=hwinfo\nsensor_cpu_temp=hwinfo:0x1/0x2/0x3").unwrap();
+    let mut s = state();
+    s.update(Ok(frame(1)), sec(0));
+    let mut f = frame(2);
+    f.entries[0].unit = "F".into();
+    s.update(Ok(f), sec(1));
+    for (time, expected) in [(1, Status::Invalid), (2, Status::NotFound)] {
+        if time == 2 {
+            let mut f = frame(3);
+            f.entries[0].identity = id(4);
+            s.update(Ok(f), sec(2));
+        }
+        let p = Projection::new(
+            &settings,
+            Some(&View {
+                state: Arc::new(s.clone()),
+                now: sec(time),
+            }),
+        );
+        let sample = p.samples[0].unwrap();
+        assert_eq!(sample.status, expected);
+        assert_eq!(sample.value, None);
+        assert!(display_text(&sample).contains("--"));
+    }
+    assert_eq!(
+        Projection::new(&settings, None).samples[0].unwrap().status,
+        Status::Unavailable
+    );
+    assert!(Projection::new(&validate_text("").unwrap(), None)
+        .samples
+        .iter()
+        .all(Option::is_none));
+}
+
+#[test]
+fn all_six_roles_share_runtime_and_editor_contract_zero_is_a_value() {
+    use trofeo_lcd::{
+        conf_edit::ConfDoc,
+        sensor_display::{footer_height, select, Projection},
+        sensor_policy::{Unit, ROLES},
+    };
+    let mut f = frame(1);
+    f.entries.clear();
+    for (i, role) in ROLES.iter().enumerate() {
+        let mut e = entry(i as u32);
+        if role.unit() == Unit::Rpm {
+            e.reading_type = ReadingType::Fan;
+            e.unit = "RPM".into();
+            e.current = 0.;
+        }
+        f.entries.push(e);
+    }
+    let mut s = state();
+    s.update(Ok(f.clone()), sec(0));
+    f.poll_time_raw = 2;
+    s.update(Ok(f), sec(1));
+    let view = View {
+        state: Arc::new(s),
+        now: sec(1),
+    };
+    let mut doc = ConfDoc::parse("sensor_source=hwinfo\n");
+    for (i, role) in ROLES.iter().enumerate() {
+        doc = select(&doc, &view, *role, id(i as u32)).unwrap();
+    }
+    let settings = validate_text(&doc.to_text()).unwrap();
+    let p = Projection::new(&settings, Some(&view));
+    for (i, role) in ROLES.iter().enumerate() {
+        let sample = p.samples[i].unwrap();
+        assert_eq!(sample.role, *role);
+        assert_eq!(sample.status, Status::Ok);
+        assert_eq!(
+            sample.value,
+            Some(if role.unit() == Unit::Rpm { 0. } else { 42. })
+        );
+        assert_eq!(p.diagnostics[i], Some(Diagnostic::ReadingUnverified));
+    }
+    assert_eq!(footer_height(&settings, 1920), 36);
+    assert_eq!(footer_height(&settings, 480), 84);
+    assert_eq!(footer_height(&validate_text("").unwrap(), 1920), 0);
 }

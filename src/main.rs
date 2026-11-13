@@ -1731,6 +1731,11 @@ fn build_display(config: &Config) -> anyhow::Result<Display> {
         .margins
         .inner(resolution.width, resolution.height)
         .map_err(|e| anyhow::anyhow!(e))?;
+    let footer = trofeo_lcd::sensor_display::footer_height(&config.sensor_source, resolution.width);
+    let ui_h = if footer == 0 { ui_h } else {
+        ui_h.checked_sub(footer).filter(|&h| h >= 64)
+            .ok_or_else(|| anyhow::anyhow!("Insufficient layout height for sensor status footer"))?
+    };
     let ui_resolution = trofeo_lcd::Resolution::new(ui_w, ui_h);
     // An animated effect (plasma, aurora, ...) takes the place of an image/video background.
     let effect_on = config.ui.effect.style.is_some();
@@ -1766,7 +1771,7 @@ fn build_display(config: &Config) -> anyhow::Result<Display> {
     } else {
         config.idle_fps
     };
-    let composite = background.is_some() || effect_on || config.background_color.is_some() || !config.margins.is_zero() || config.ui.panel_opacity < 100;
+    let composite = footer > 0 || background.is_some() || effect_on || config.background_color.is_some() || !config.margins.is_zero() || config.ui.panel_opacity < 100;
     let fb = Framebuffer::new(resolution);
     let ui = Framebuffer::new(if composite { ui_resolution } else { trofeo_lcd::Resolution::new(1, 1) });
     Ok(Display { resolution, background, idle_fps_effective, composite, fb, ui })
@@ -2651,6 +2656,23 @@ fn main() -> anyhow::Result<()> {
             latest_gpu_data.fps = fps_etw::pick_fps(config.fps_source, driver_fps, etw_fps);
             FPS_NOW.store(latest_gpu_data.fps.unwrap_or(0).max(0) as u32, std::sync::atomic::Ordering::Relaxed);
         }
+        let hwinfo_view = hwinfo_worker.as_ref().and_then(|w| w.view());
+        let hwinfo_display = trofeo_lcd::sensor_display::Projection::new(&config.sensor_source, hwinfo_view.as_ref());
+        let mut projected = lhm::current();
+        for (i, sample) in hwinfo_display.samples.iter().enumerate() {
+            let Some(sample) = sample else { continue };
+            match i {
+                0 => { latest_cpu_temp = sample.value.map(|v| v as f32); projected.cpu_temp = latest_cpu_temp; },
+                1 => projected.cpu_fan = sample.value.map(|v| v as u32),
+                2 => projected.case_fan = sample.value.map(|v| v as u32),
+                3 => projected.pump = sample.value.map(|v| v as u32),
+                4 => projected.mb_temp = sample.value.map(|v| v as f32),
+                5 => latest_gpu_data.temp_edge_c = sample.value.map(|v| v.round() as i32),
+                _ => unreachable!(),
+            }
+        }
+        lhm::set_current(projected);
+        dash_screen.set_hwinfo_history(hwinfo_display.history);
         // "Gaming" mode detection (`gaming_active`: GPU usage above `gaming_gpu_percent`). Used for two things:
         // swap the "NOW PLAYING" content for the foreground exe name, AND replace the
         // EQ bar/clock area with the performance dashboard (see draw_game_dashboard).
@@ -2894,6 +2916,7 @@ fn main() -> anyhow::Result<()> {
             fb.blit_ui(&ui, config.margins.left, config.margins.top, UI_KEY, panel);
         }
 
+        hwinfo_display.draw(&mut fb);
         // The "new version available" banner, on top of everything, for a few seconds.
         if let Some(v) = update_monitor.take_new() {
             update_notice = Some((v, Instant::now()));
@@ -5210,7 +5233,7 @@ mod layout_tests {
             assert!(effect::Palette::parse(p).is_some(), "{p}");
         }
         // every key of the editor is one the program reads from the config file
-        let from_cli_or_file = |k: &str| is_override_key(k) || ["orientation", "flip", "panel_size", "background", "background_dim", "ffmpeg", "language",
+        let from_cli_or_file = |k: &str| is_override_key(k) || trofeo_lcd::sensor_policy::cli_key(&format!("--{}", k.replace('_', "-"))).is_some() || ["orientation", "flip", "panel_size", "background", "background_dim", "ffmpeg", "language",
             "hid_mount", "hid_header", "color", "silence_threshold", "silence_timeout_ms", "weather_city", "ticker_source", "ticker_refresh_min", "gpu_usage_source", "fps_source", "fps_driver_divisor", "update_check", "update_check_hours", "update_notice_secs", "margin", "margin_top", "margin_bottom", "margin_left", "margin_right"].contains(&k);
         for f in fields() {
             assert!(from_cli_or_file(&f.key), "{} is not a key of the program", f.key);

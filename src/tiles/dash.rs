@@ -379,6 +379,9 @@ pub fn parse(file: &ConfigFile) -> anyhow::Result<Settings> {
 /// The last readings of what the graphs draw, one per second.
 pub struct History {
     series: HashMap<&'static str, VecDeque<f32>>,
+    hwinfo: [Option<trofeo_lcd::sensor_display::HistoryKey>; 6],
+    sampled_hwinfo: [Option<trofeo_lcd::sensor_display::HistoryKey>; 6],
+    fan_role: Option<usize>,
     last: Option<f64>,
     /// Counts the samples taken (part of the redraw signature).
     pub(super) rev: u64,
@@ -386,9 +389,29 @@ pub struct History {
 
 impl History {
     pub(super) fn new() -> Self {
-        History { series: HashMap::new(), last: None, rev: 0 }
+        History { series: HashMap::new(), hwinfo: [None; 6], sampled_hwinfo: [None; 6], fan_role: None, last: None, rev: 0 }
     }
 
+    fn set_hwinfo(&mut self, keys: [Option<trofeo_lcd::sensor_display::HistoryKey>; 6]) {
+        for (i, key) in keys.iter().enumerate() {
+            let old = self.hwinfo[i];
+            if old != *key && !matches!((old, *key), (Some(a), Some(b)) if a.same_epoch(b)) {
+                let series = match i { 0 => "cpu_temp", 5 => "gpu_temp", 1..=3 if self.fan_role == Some(i) => "fan", _ => continue };
+                self.series.remove(series);
+                self.sampled_hwinfo[i] = None;
+                self.rev += 1;
+            }
+        }
+        self.hwinfo = keys;
+    }
+    fn set_fan_role(&mut self, role: Option<usize>) {
+        if self.fan_role != role {
+            self.series.remove("fan");
+            self.sampled_hwinfo[1..4].fill(None);
+            self.fan_role = role;
+            self.rev += 1;
+        }
+    }
     /// Takes a sample when a second has passed since the last one.
     pub(super) fn sample(&mut self, secs: f64, keep: usize, values: &[(&'static str, Option<f32>)]) {
         if self.last.is_some_and(|l| secs - l < 1.0 && secs >= l) {
@@ -397,6 +420,12 @@ impl History {
         self.last = Some(secs);
         self.rev += 1;
         for (k, v) in values {
+            let indices: &[usize] = match *k { "cpu_temp" => &[0], "gpu_temp" => &[5], "fan" => match self.fan_role { Some(1) => &[1], Some(2) => &[2], Some(3) => &[3], _ => &[] }, _ => &[] };
+            if indices.iter().any(|&i| self.hwinfo[i].is_some()) {
+                if indices.iter().any(|&i| self.hwinfo[i].is_some_and(|k| !k.usable)) { continue; }
+                if indices.iter().all(|&i| self.hwinfo[i] == self.sampled_hwinfo[i]) { continue; }
+                for &i in indices { self.sampled_hwinfo[i] = self.hwinfo[i]; }
+            }
             let q = self.series.entry(k).or_default();
             if let Some(v) = v {
                 q.push_back(*v);
@@ -1615,8 +1644,11 @@ impl DashScreen {
         }
     }
 
-    /// Frames per second the screen wants: the graphs move once a second, a background effect
-    /// or image needs its own rate.
+    /// Invalidate sensor histories even while this screen is inactive.
+    pub fn set_hwinfo_history(&mut self, keys: [Option<trofeo_lcd::sensor_display::HistoryKey>; 6]) {
+        self.hist.set_hwinfo(keys);
+    }
+    /// Frames per second required by the graphs and background.
     pub fn wanted_fps(s: &Settings, effect_fps: f32, active_fps: f32) -> f32 {
         match s.bg {
             BgMode::Effect => effect_fps,
@@ -1640,6 +1672,12 @@ impl DashScreen {
         let hw = lhm::current();
         let secs = env.secs.unwrap_or_else(|| self.started.elapsed().as_secs_f64());
         let ram_pct = if data.total_mb > 0 { data.used_mb as f32 * 100.0 / data.total_mb as f32 } else { 0.0 };
+        // The shared fan graph follows the actual visible role, not an unrelated
+        // HWiNFO binding. A switch between CPU/case/pump/GPU starts a new series.
+        self.hist.set_fan_role(if hw.cpu_fan.is_some() { Some(1) }
+            else if hw.case_fan.is_some() { Some(2) }
+            else if hw.pump.is_some() { Some(3) }
+            else if hw.gpu_fan.is_some() { Some(6) } else { None });
         let sampled: [(&'static str, Option<f32>); 9] = [
             ("cpu_temp", data.cpu_temp),
             ("cpu_pct", Some(data.cpu_pct)),
@@ -2042,4 +2080,46 @@ mod tests {
         }
         assert!(any);
     }
+}
+
+#[cfg(test)]
+mod hwinfo_history_tests {
+    use super::*;
+    use trofeo_lcd::{sensor_display::HistoryKey,sensor_policy::HwinfoSelector};
+    #[test]
+    fn segregate_identity_generation_invalidity_and_do_not_resample_same_poll() {
+        let mut h=History::new();
+        let mut key=HistoryKey {identity:HwinfoSelector {sensor_id:1,sensor_instance:0,reading_id:2},generation:1,publisher_poll:Some(1),usable:true};
+        let mut keys=[None;6];keys[0]=Some(key);h.set_hwinfo(keys);
+        h.sample(0.,60,&[("cpu_temp",Some(42.))]);
+        h.sample(1.,60,&[("cpu_temp",Some(42.))]);assert_eq!(h.get("cpu_temp"),vec![42.]);
+        key.publisher_poll=Some(2);keys[0]=Some(key);h.set_hwinfo(keys);
+        h.sample(2.,60,&[("cpu_temp",Some(43.))]);assert_eq!(h.get("cpu_temp"),vec![42.,43.]);
+        key.usable=false;keys[0]=Some(key);h.set_hwinfo(keys);assert!(h.get("cpu_temp").is_empty());
+        h.sample(3.,60,&[("cpu_temp",None)]);assert!(h.get("cpu_temp").is_empty());
+        for change in 0..3 {
+            key.usable=true;key.publisher_poll=Some(3+change);
+            if change==1 {key.generation+=1;} if change==2 {key.identity.reading_id+=1;}
+            keys[0]=Some(key);h.set_hwinfo(keys);assert!(h.get("cpu_temp").is_empty());
+            h.sample(4.+change as f64,60,&[("cpu_temp",Some(50.))]);assert_eq!(h.get("cpu_temp"),vec![50.]);
+        }
+        h.set_hwinfo([None;6]);assert!(h.get("cpu_temp").is_empty());
+        h.sample(10.,60,&[("cpu_temp",Some(20.))]);assert_eq!(h.get("cpu_temp"),vec![20.]);
+    }
+    #[test]
+    fn fan_history_tracks_actual_role_and_preserves_unrelated_native_samples() {
+        let mut h=History::new();h.set_fan_role(Some(1));
+        let key=HistoryKey {identity:HwinfoSelector{sensor_id:1,sensor_instance:0,reading_id:2},generation:1,publisher_poll:Some(1),usable:true};
+        let mut keys=[None;6]; keys[3]=Some(key);h.set_hwinfo(keys);
+        h.sample(0.,60,&[("fan",Some(1000.))]);
+        h.sample(1.,60,&[("fan",Some(1100.))]);
+        assert_eq!(h.get("fan"),vec![1000.,1100.]); // native CPU fan unaffected by HWiNFO pump
+        h.set_fan_role(Some(3));assert!(h.get("fan").is_empty());
+        h.sample(2.,60,&[("fan",Some(2000.))]);
+        h.sample(3.,60,&[("fan",Some(2000.))]);assert_eq!(h.get("fan"),vec![2000.]);
+        keys[3].as_mut().unwrap().usable=false;h.set_hwinfo(keys);assert!(h.get("fan").is_empty());
+        h.set_fan_role(Some(2));h.sample(4.,60,&[("fan",Some(800.))]);
+        assert_eq!(h.get("fan"),vec![800.]);
+    }
+
 }
