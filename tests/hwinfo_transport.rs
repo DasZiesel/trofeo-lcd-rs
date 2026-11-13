@@ -511,3 +511,122 @@ fn access_denied_is_distinct_for_test_mutex_and_mapping() {
         );
     }
 }
+
+fn diagnostic(f: &Fixture, extra: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_hwinfo_diag"))
+        .args(["--synthetic", &f.token])
+        .args(extra)
+        .output()
+        .unwrap()
+}
+fn diagnostic_fixture() -> Fixture {
+    let f = Fixture::new(900);
+    let mut data = header(123);
+    data.resize(900, 0);
+    for (at, n) in [
+        (28, 1u32),
+        (32, 440),
+        (40, 1),
+        (44, 2000),
+        (48, 0x1234),
+        (52, 2),
+        (440, 1),
+        (448, 0x5678),
+    ] {
+        data[at..at + 4].copy_from_slice(&n.to_le_bytes());
+    }
+    data[56..62].copy_from_slice(b"SECRET");
+    data[724..732].copy_from_slice(&42.5f64.to_le_bytes());
+    data[884..888].copy_from_slice(b"degC");
+    f.write(&data);
+    f
+}
+#[test]
+fn diagnostic_defaults_to_three_metadata_only_copies() {
+    let f = diagnostic_fixture();
+    let output = diagnostic(&f, &[]);
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(text.lines().count(), 3);
+    assert!(text.contains(
+        "version=2 revision=1 sensors=1 readings=1 poll_time_raw=123 polling_period_raw=Some(2000)"
+    ));
+    assert_eq!(text.matches("status=Unverified").count(), 3);
+    for private in [
+        "SECRET",
+        "0x00001234",
+        "0x00005678",
+        "degC",
+        "42.5",
+        "inventory ",
+    ] {
+        assert!(!text.contains(private));
+    }
+}
+#[test]
+fn diagnostic_inventory_is_separately_gated_and_escaped() {
+    let f = diagnostic_fixture();
+    assert_eq!(diagnostic(&f, &["--inventory"]).status.code(), Some(2));
+    let output = diagnostic(
+        &f,
+        &["--snapshots", "1", "--inventory", "--acknowledge-inventory"],
+    );
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(text.lines().count(), 2);
+    assert!(text.contains("sensor_id=0x00001234 instance=0x00000002 reading_id=0x00005678 type=Temperature unit=utf8:\"degC\" current=42.5 status=Unverified"));
+    assert!(!text.contains("SECRET"));
+}
+#[test]
+fn diagnostic_stops_after_first_decoder_error() {
+    let f = Fixture::new(48);
+    let output = diagnostic(&f, &[]);
+    assert_eq!(output.status.code(), Some(1));
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(text.lines().count(), 1);
+    assert!(text.contains("decoder=error error=Signature(0)"));
+}
+#[test]
+fn diagnostic_timeout_does_not_retry() {
+    let f = Fixture::new(48);
+    let (stop, worker) = hold(f.token.clone(), false);
+    let output = diagnostic(&f, &[]);
+    stop.send(()).unwrap();
+    worker.join().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(text.lines().count(), 1);
+    assert!(text.contains("error=Timeout decoder=not_run"));
+}
+#[test]
+fn diagnostic_invalid_options_do_not_open_objects() {
+    let f = Fixture::new(48); // invalid header would produce exit 1 if captured
+    for options in [
+        vec!["--snapshots", "4"],
+        vec!["--live"],
+        vec!["--output", "file"],
+    ] {
+        let output = diagnostic(&f, &options);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+    }
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_hwinfo_diag"))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+}
+#[test]
+fn diagnostic_missing_mapping_is_transport_error() {
+    let mut f = Fixture::new(48);
+    unsafe {
+        CloseHandle(f.mapping);
+    }
+    f.mapping = std::ptr::null_mut();
+    let output = diagnostic(&f, &[]);
+    assert_eq!(output.status.code(), Some(1));
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(text.lines().count(), 1);
+    assert!(text.contains("NotFound"));
+    assert!(text.contains("decoder=not_run"));
+}
