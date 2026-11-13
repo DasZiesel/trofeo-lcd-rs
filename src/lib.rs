@@ -49,6 +49,7 @@ pub mod dxgi_capture;
 pub mod background;
 pub mod config;
 pub mod sensor_policy;
+pub mod hwinfo_sm2;
 pub mod conf_edit;
 pub mod schema;
 pub mod i18n;
