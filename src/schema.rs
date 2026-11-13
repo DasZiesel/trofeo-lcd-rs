@@ -708,8 +708,8 @@ pub fn fields() -> Vec<Field> {
     // Source bindings share the application's hardware-free validator.
     for key in ["sensor_source", "bridge_mode", "bridge_service", "sensor_cpu_temp", "sensor_cpu_fan", "sensor_case_fan", "sensor_pump", "sensor_mb_temp", "sensor_gpu_temp"] {
         add(Field::new(key, "lhm", key, key, Text).group("sensor_sources").restart()
-            .help("Source: auto/native/lhm/hwinfo/bridge. Binding: source:alias or hwinfo:0x00000001/0x00000000/0x00000002. HWiNFO and Bridge are unavailable in this build.",
-                  "Fonte: auto/native/lhm/hwinfo/bridge. Selettore: source:alias o hwinfo:0x00000001/0x00000000/0x00000002. HWiNFO e Bridge non disponibili in questa versione."));
+            .help("Source: auto/native/lhm/hwinfo/bridge. Binding: source:alias or hwinfo:0x00000001/0x00000000/0x00000002. HWiNFO requires Windows x64 and explicit IDs; reading quality remains unverified. Bridge is unavailable in this build.",
+                  "Fonte: auto/native/lhm/hwinfo/bridge. Selettore: source:alias o hwinfo:0x00000001/0x00000000/0x00000002. HWiNFO richiede Windows x64 e ID espliciti; la qualita dei valori resta non verificata. Bridge non disponibile in questa versione."));
     }
     // ---- LibreHardwareMonitor
     add(Field::new("lhm", "lhm", "Read fans and sensors from LibreHardwareMonitor", "Leggi ventole e sensori da LibreHardwareMonitor", Bool)

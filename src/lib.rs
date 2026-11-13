@@ -50,6 +50,7 @@ pub mod background;
 pub mod config;
 pub mod sensor_policy;
 pub mod hwinfo_sm2;
+pub mod hwinfo_provider;
 #[cfg(all(windows, target_pointer_width = "64"))]
 pub mod hwinfo_transport;
 pub mod conf_edit;

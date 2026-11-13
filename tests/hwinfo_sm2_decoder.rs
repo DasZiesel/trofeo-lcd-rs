@@ -381,10 +381,12 @@ fn time_metadata_never_confirms_live_data_or_activates_provider() {
     b[12..20].copy_from_slice(&i64::MAX.to_le_bytes());
     put32(&mut b, 44, 0);
     assert_eq!(decode(&b).unwrap().status(), Status::Unverified);
-    assert!(validate_text("sensor_source=hwinfo")
-        .unwrap()
-        .ensure_available()
-        .is_err());
+    let settings = validate_text("sensor_source=hwinfo").unwrap();
+    assert!(!settings.native_cpu());
+    assert_eq!(
+        settings.ensure_available().is_ok(),
+        cfg!(all(windows, target_pointer_width = "64"))
+    );
 }
 #[test]
 fn deterministic_mutation_and_random_corpus_never_panics() {

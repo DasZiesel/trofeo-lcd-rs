@@ -345,7 +345,7 @@ fn print_help() {
          \x20\x20--sensor-source <auto|native|lhm|hwinfo|bridge>  Default sensor strategy\n\
          \x20\x20--sensor-<cpu-temp|cpu-fan|case-fan|pump|mb-temp|gpu-temp> <source:selector>\n\
          \x20\x20--bridge-mode <real|mock> --bridge-service <name>  Reserved Bridge settings\n\
-         \x20\x20  HWiNFO IDs: hwinfo:0x00000001/0x00000000/0x00000002; hwinfo/bridge unavailable in this build\n\
+         \x20\x20  HWiNFO IDs: hwinfo:0x00000001/0x00000000/0x00000002; HWiNFO: Windows x64, unverified readings; Bridge unavailable\n\
          \x20\x20--lhm-list              Lists what LibreHardwareMonitor reports (fans, temperatures)\n\
          \x20\x20                          and which sensor is used for each role, then exits.\n\
          \x20\x20--lhm <true|false>      Read fan speeds etc. from LibreHardwareMonitor's web\n\
@@ -2141,6 +2141,14 @@ fn main() -> anyhow::Result<()> {
     // Wrapped in `Arc<Mutex<_>>` because it's shared with the DeepCool
     // integration thread (so both screens use a single sensor instance / a single
     // PawnIO handle — instead of opening two).
+    // All HWiNFO IO/decoding is owned by this cancellable background worker.
+    // Auto never starts it; dropping it on exit requests cancellation and joins.
+    #[cfg(all(windows, target_pointer_width="64"))]
+    let hwinfo_worker = if config.sensor_source.hwinfo() {
+        Some(trofeo_lcd::hwinfo_provider::Worker::start(Default::default()).map_err(|e| anyhow::anyhow!(e))?)
+    } else { None };
+    #[cfg(not(all(windows, target_pointer_width="64")))]
+    let hwinfo_worker: Option<trofeo_lcd::hwinfo_provider::Worker> = None;
     let cpu_sensor = config.sensor_source.native_cpu().then(|| Arc::new(Mutex::new(cpu_sensor::CpuSensor::new())));
     // Baseline energy counter before the loop starts — used for the first
     // power draw snapshot on the first sysinfo refresh iteration (see the loop section).
@@ -2613,7 +2621,8 @@ fn main() -> anyhow::Result<()> {
             let native = [native_cpu_temp.map(f64::from), None, None, None, None, latest_gpu_data.temp_edge_c.map(f64::from)];
             let lhm_values = [lhm_now.cpu_temp.map(f64::from), lhm_now.cpu_fan.map(f64::from), lhm_now.case_fan.map(f64::from), lhm_now.pump.map(f64::from), lhm_now.mb_temp.map(f64::from), None];
             let legacy = [latest_cpu_temp.map(f64::from), lhm_values[1], lhm_values[2], lhm_values[3], lhm_values[4], native[5]];
-            let roles = config.sensor_source.resolve(native, lhm_values, legacy);
+            let hwinfo_view = hwinfo_worker.as_ref().and_then(|w| w.view());
+            let roles = config.sensor_source.resolve_with_hwinfo(native, lhm_values, legacy, hwinfo_view.as_ref());
             latest_cpu_temp = roles[0].value.map(|v| v as f32);
             lhm_now.cpu_temp = latest_cpu_temp;
             lhm_now.cpu_fan = roles[1].value.map(|v| v as u32);

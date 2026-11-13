@@ -805,3 +805,43 @@ fn transport_rejects_old_signature_and_accepts_only_hwis_wire_bytes() {
     assert_eq!(&copy.bytes()[..4], b"HWiS");
     assert_eq!(copy.decode().unwrap().status(), Status::Unverified);
 }
+
+#[test]
+fn provider_worker_uses_synthetic_transport_and_stops_cleanly() {
+    use trofeo_lcd::hwinfo_provider::{Failure, Frame, Options, Worker};
+    let f = Fixture::new(48);
+    f.write(&header(1));
+    let transport = f.transport(100);
+    let mut worker = Worker::spawn_with(
+        Options {
+            poll_interval: Duration::from_millis(100),
+            stale_after: Duration::from_secs(1),
+        },
+        move |cancel| {
+            let copy = transport.capture(cancel).map_err(Failure::Transport)?;
+            Frame::decode(copy.bytes())
+        },
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !worker.view().is_some_and(|v| v.state.frame.is_some()) {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(5));
+    }
+    f.write(&header(2));
+    while !worker
+        .view()
+        .is_some_and(|v| v.state.snapshot_status(v.now) == Status::Ok)
+    {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(5));
+    }
+    worker.shutdown().unwrap();
+    assert_eq!(
+        worker.view().unwrap().state.snapshot_status(Duration::ZERO),
+        Status::Closed
+    );
+    let (stop, other) = hold(f.token.clone(), false);
+    stop.send(()).unwrap();
+    other.join().unwrap();
+}

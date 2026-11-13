@@ -158,7 +158,7 @@ pub enum Status {
     Disabled,
     Closed,
 }
-/// Normalized role value. Identity, time and generation belong to a future provider snapshot.
+/// Normalized role value. Identity, time and generation remain in provider snapshots.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Sample {
     pub source: Source,
@@ -168,7 +168,7 @@ pub struct Sample {
     pub status: Status,
 }
 impl Sample {
-    fn new(source: Source, role: Role, value: Option<f64>, status: Status) -> Self {
+    pub(crate) fn new(source: Source, role: Role, value: Option<f64>, status: Status) -> Self {
         let valid = value.filter(|v| {
             v.is_finite() && (role.unit() != Unit::Rpm || (*v >= 0.0 && *v <= u32::MAX as f64))
         });
@@ -313,11 +313,33 @@ impl Settings {
     pub fn legacy(&self) -> bool {
         self.roles.iter().all(|b| *b == Binding::Legacy)
     }
+    pub fn hwinfo(&self) -> bool {
+        self.source == Source::Hwinfo || self.roles.iter().any(|b| matches!(b, Binding::Hwinfo(_)))
+    }
+    /// Explicit HWiNFO bindings only; all other roles keep their existing policy.
+    /// A missing/contended worker view is unavailable, never a fallback source.
+    pub fn resolve_with_hwinfo(
+        &self,
+        native: [Option<f64>; 6],
+        lhm: [Option<f64>; 6],
+        legacy: [Option<f64>; 6],
+        view: Option<&crate::hwinfo_provider::View>,
+    ) -> [Sample; 6] {
+        let mut samples = self.resolve(native, lhm, legacy);
+        for (i, binding) in self.roles.iter().enumerate() {
+            if let Binding::Hwinfo(id) = binding {
+                samples[i] = view
+                    .map(|v| v.resolve(ROLES[i], *id).sample)
+                    .unwrap_or_else(|| {
+                        Sample::new(Source::Hwinfo, ROLES[i], None, Status::Unavailable)
+                    });
+            }
+        }
+        samples
+    }
     pub fn ensure_available(&self) -> Result<(), String> {
-        if self.source == Source::Hwinfo
-            || self.roles.iter().any(|b| matches!(b, Binding::Hwinfo(_)))
-        {
-            return Err("sensor provider hwinfo is unavailable in this build".into());
+        if self.hwinfo() && !cfg!(all(windows, target_pointer_width = "64")) {
+            return Err("sensor provider hwinfo is unavailable on this platform".into());
         }
         if self.source == Source::Bridge || self.bridge() {
             return Err("sensor provider bridge is unavailable in this build".into());

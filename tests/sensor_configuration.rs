@@ -102,10 +102,7 @@ fn configuration_errors_are_not_provider_errors() {
 #[test]
 fn unavailable_provider_blocks_startup_even_with_native_overrides() {
     for text in [
-        "sensor_source=hwinfo",
         "sensor_source=bridge\nbridge_mode=mock",
-        "sensor_cpu_temp=hwinfo:0x1/0x0/0x2",
-        "sensor_source=hwinfo\nsensor_cpu_temp=native:cpu_temp",
         "sensor_source=auto\nsensor_pump=bridge:aio_pump\nbridge_mode=real",
     ] {
         let c = settings(text);
@@ -206,7 +203,10 @@ fn editor_roundtrip_and_shared_validation() {
             && text.contains("Fan #2")
     );
     let c = validate_text(&text).unwrap();
-    assert!(c.ensure_available().is_err()); // Valid to save for a future provider.
+    assert_eq!(
+        c.ensure_available().is_ok(),
+        cfg!(all(windows, target_pointer_width = "64"))
+    );
     doc.set("sensor_cpu_temp", "hwinfo:broken");
     assert!(validate_text(&doc.to_text()).is_err());
     let fields = trofeo_lcd::schema::fields();
@@ -232,5 +232,8 @@ fn all_roles_allow_persisted_id_triplets_without_discovery() {
     let id: HwinfoSelector = "hwinfo:0x1/0x0/0x2".parse().unwrap();
     assert!(c.roles.iter().all(|b| *b == Binding::Hwinfo(id)));
     assert!(!c.native_cpu());
-    assert!(c.ensure_available().is_err());
+    assert_eq!(
+        c.ensure_available().is_ok(),
+        cfg!(all(windows, target_pointer_width = "64"))
+    );
 }
