@@ -1207,6 +1207,7 @@ struct App {
     lcd_test: LcdTest,
     hwinfo_worker: Option<trofeo_lcd::hwinfo_provider::Worker>,
     hwinfo_search: String,
+    sensor_editor_only: bool,
 }
 
 fn default_path() -> PathBuf {
@@ -1242,6 +1243,7 @@ impl App {
             lcd_test: LcdTest::new(),
             hwinfo_worker: None,
             hwinfo_search: String::new(),
+            sensor_editor_only: false,
         };
         app.load(&path);
         app
@@ -1354,6 +1356,7 @@ impl App {
     }
 
     fn drive_preview(&mut self, ctx: &egui::Context) {
+        if self.sensor_editor_only { return; }
         self.poll_preview(ctx);
         let Some(exe) = self.preview.exe.clone() else { return };
         let t_step = if self.animate { (self.anim_start.elapsed().as_secs_f64() * 2.0) as i64 } else { 0 };
@@ -1387,7 +1390,21 @@ impl App {
 
     // ---- panels
 
+    fn isolate_sensor_editor(&mut self) {
+        self.sensor_editor_only = true;
+        self.preview.exe = None;
+        self.screenshot = None;
+        self.section = "lhm".into();
+    }
     fn top_bar(&mut self, ui: &mut egui::Ui) {
+        if self.sensor_editor_only {
+            ui.horizontal(|ui| {
+                if ui.button("Save test configuration").clicked() { self.save(); }
+                if ui.button("Reload test configuration").clicked() { let p=self.path.clone(); self.load(&p); }
+                ui.label("Sensor editor only: no LCD preview or device tests");
+            });
+            return;
+        }
         let l = self.lang;
         ui.horizontal(|ui| {
             if ui.button(tr(l, "New", "Nuovo")).clicked() {
@@ -1454,6 +1471,7 @@ impl App {
     }
 
     fn preview_panel(&mut self, ui: &mut egui::Ui, side: bool) {
+        if self.sensor_editor_only { ui.label("Selected HWiNFO values and status appear in sensor assignments. Individual reading freshness remains unverified."); return; }
         let l = self.lang;
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new(tr(l, "Preview", "Anteprima")).strong());
@@ -1511,6 +1529,7 @@ impl App {
     }
 
     fn sections_panel(&mut self, ui: &mut egui::Ui) {
+        if self.sensor_editor_only { ui.label("Sensor sources"); return; }
         let l = self.lang;
         ui.add_space(4.0);
         for (id, en, it) in schema::SECTIONS {
@@ -1546,6 +1565,7 @@ impl App {
                 #[cfg(not(all(windows, target_pointer_width = "64")))]
                 self.say("HWiNFO requires Windows x64", true);
             }
+            if self.hwinfo_worker.is_some() { ui.ctx().request_repaint_after(Duration::from_millis(500)); }
             let view = self.hwinfo_worker.as_ref().and_then(|w| w.view());
             let Some(view) = view else { ui.label("Inventory stopped or busy. Existing bindings are retained; manual IDs remain editable below."); return; };
             ui.ctx().request_repaint_after(Duration::from_millis(500));
@@ -1563,12 +1583,11 @@ impl App {
                 ui.label(format!("{} (compatible type/unit only)", &key[7..]));
                 if let Ok(id) = current.parse::<trofeo_lcd::sensor_policy::HwinfoSelector>() {
                     let resolved = view.resolve(role, id);
-                    ui.label(format!("Display: {:?}; {:?}", resolved.sample.status, resolved.diagnostic));
+                    ui.label(format!("{}; {:?}", sensor_display::display_text(&resolved.sample), resolved.diagnostic));
                 }
                 egui::ComboBox::from_id_salt(("hwinfo_picker", key)).selected_text(selected).show_ui(ui, |ui| {
                     if ui.selectable_label(current.is_empty(), "Use source default").clicked() { self.ed.unset(key); self.ed.bufs.remove(key); }
-                    for entry in frame.entries.iter().filter(|e| sensor_display::compatible(e, role))
-                        .filter(|e| search.is_empty() || format!("{} {} {}", e.sensor_name, e.label, e.identity).to_lowercase().contains(&search)).take(200) {
+                    for entry in frame.entries.iter().filter(|e| sensor_display::matches_search(e, role, &search)).take(200) {
                         let title = format!("{} / {} [{}] — {}", entry.sensor_name, entry.label, entry.unit, entry.identity);
                         if ui.selectable_label(current == entry.identity.to_string(), title).clicked() {
                             match sensor_display::select(&self.ed.doc, &view, role, entry.identity) {
@@ -1784,9 +1803,11 @@ fn main() -> eframe::Result<()> {
     let mut path: Option<PathBuf> = None;
     let (mut lang, mut section, mut shot): (Option<Lang>, _, _) = (None, None, None);
     let mut size = [1280.0f32, 860.0];
+    let mut sensor_editor_only = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
+            "--sensor-editor-only" => sensor_editor_only = true,
             "--lang" => lang = Some(if it.next().is_some_and(|v| v.starts_with("en")) { Lang::En } else { Lang::It }),
             "--section" => section = it.next().cloned(),
             "--screenshot" => shot = it.next().map(PathBuf::from),
@@ -1799,6 +1820,11 @@ fn main() -> eframe::Result<()> {
             _ => {}
         }
     }
+    if sensor_editor_only && (path.as_ref().is_none_or(|p| !p.is_file()) || shot.is_some()) {
+        eprintln!("--sensor-editor-only requires an explicit existing test configuration and forbids --screenshot");
+        std::process::exit(2);
+    }
+    if sensor_editor_only { lang = Some(Lang::En); }
     let path = path.unwrap_or_else(default_path);
     // --lang wins; otherwise the saved choice, the language of the configuration, the system
     let lang = lang.unwrap_or_else(|| {
@@ -1818,7 +1844,9 @@ fn main() -> eframe::Result<()> {
             style.spacing.item_spacing = egui::vec2(8.0, 5.0);
             style.spacing.slider_width = 200.0;
             cc.egui_ctx.set_style(style);
-            Ok(Box::new(App::new(path.clone(), lang, section.clone(), shot.clone())))
+            let mut app=App::new(path.clone(), lang, section.clone(), shot.clone());
+            if sensor_editor_only { app.isolate_sensor_editor(); }
+            Ok(Box::new(app))
         }),
     )
 }
@@ -2010,5 +2038,22 @@ mod hwinfo_persistence_tests {
         let text=std::fs::read_to_string(&path).unwrap();assert!(!text.contains("Renamable"));assert!(!text.contains("Synthetic"));assert!(text.contains("# preserved"));
         app.ed.set("sensor_cpu_temp","hwinfo:bad");assert!(!app.save_to(&path));assert_eq!(std::fs::read_to_string(&path).unwrap(),text);
         // Retain synthetic outputs for inspection; no global settings or app loop used.
+    }
+}
+
+#[cfg(test)]
+mod isolated_sensor_editor_tests {
+    use super::*;
+    #[test]
+    fn isolated_editor_cannot_schedule_lcd_preview_or_device_test() {
+        let path=std::env::current_exe().unwrap().with_extension("synthetic-isolation.conf");
+        let mut app=App::new(path,Lang::En,None,None);
+        app.isolate_sensor_editor();
+        assert!(app.sensor_editor_only);assert!(app.preview.exe.is_none());assert!(app.screenshot.is_none());
+        assert_eq!(app.section,"lhm");assert!(app.hwinfo_worker.is_none());
+        // Even if discovery were changed later, the explicit guard stops scheduling.
+        app.preview.exe=Some(PathBuf::from("must-not-run.exe"));
+        app.drive_preview(&egui::Context::default());
+        assert!(app.preview.rx.is_none());assert!(app.preview.due.is_none());
     }
 }

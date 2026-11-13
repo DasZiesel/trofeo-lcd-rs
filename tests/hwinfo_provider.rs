@@ -568,3 +568,17 @@ fn all_six_roles_share_runtime_and_editor_contract_zero_is_a_value() {
     assert_eq!(footer_height(&settings, 480), 84);
     assert_eq!(footer_height(&validate_text("").unwrap(), 1920), 0);
 }
+
+#[test]
+fn editor_search_respects_type_unit_ids_case_and_renames() {
+    use trofeo_lcd::sensor_display::matches_search;
+    let mut e = entry(3);
+    assert!(matches_search(&e, Role::CpuTemp, "SYNTHETIC"));
+    assert!(matches_search(&e, Role::CpuTemp, "0x00000003"));
+    assert!(!matches_search(&e, Role::CpuFan, ""));
+    e.label = "Renamed reading".into();
+    assert!(matches_search(&e, Role::CpuTemp, "renamed"));
+    assert!(!matches_search(&e, Role::CpuTemp, "Temperature"));
+    e.unit = "F".into();
+    assert!(!matches_search(&e, Role::CpuTemp, "renamed"));
+}

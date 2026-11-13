@@ -2159,4 +2159,38 @@ mod hwinfo_pipeline_tests {
   let p=Projection::new(&settings,Some(&View{state:Arc::new(state),now:Duration::from_secs(11)}));hist.set_hwinfo(p.history);
   assert!(hist.get("cpu_temp").is_empty());assert_eq!(p.samples[0].unwrap().status,Status::Unavailable);
  }
+ #[test]
+ fn worker_mapping_projection_history_recovers_without_stale_numbers() {
+  use trofeo_lcd::hwinfo_provider::Worker;
+  use std::sync::atomic::{AtomicBool,Ordering};
+  let mapping=fixture::Mapping::new();mapping.write(&fixture::bytes(1,false,false,false));
+  let transport=trofeo_lcd::hwinfo_transport::Transport::synthetic(&mapping.token,100).unwrap();
+  let offline=Arc::new(AtomicBool::new(false));let fail=offline.clone();
+  let mut worker=Worker::spawn_with(Options{poll_interval:Duration::from_millis(100),stale_after:Duration::from_millis(400)},move|cancel|{
+   if fail.load(Ordering::Acquire) {return Err(Failure::Unavailable);}
+   let copy=transport.capture(cancel).map_err(Failure::Transport)?;Frame::decode(copy.bytes())
+  }).unwrap();
+  let settings=trofeo_lcd::sensor_policy::validate_text("sensor_source=hwinfo\nsensor_cpu_temp=hwinfo:0x1/0x0/0x3").unwrap();
+  let wait=|expected| {
+   let deadline=std::time::Instant::now()+Duration::from_secs(3);
+   loop {if let Some(v)=worker.view(){let p=Projection::new(&settings,Some(&v));if p.samples[0].unwrap().status==expected{return p;}}
+    assert!(std::time::Instant::now()<deadline,"missing worker state {expected:?}");std::thread::sleep(Duration::from_millis(5));}
+  };
+  let mut history=History::new();
+  let first=wait(Status::Unverified);history.set_hwinfo(first.history);
+  mapping.write(&fixture::bytes(2,true,true,false));let ready=wait(Status::Ok);
+  history.set_hwinfo(ready.history);history.sample(1.,60,&[("cpu_temp",ready.samples[0].unwrap().value.map(|v|v as f32))]);assert_eq!(history.get("cpu_temp"),vec![41.]);
+  let stale=wait(Status::Stale);assert!(stale.samples[0].unwrap().value.is_none());history.set_hwinfo(stale.history);assert!(history.get("cpu_temp").is_empty());
+  offline.store(true,Ordering::Release);let lost=wait(Status::Unavailable);assert!(lost.samples[0].unwrap().value.is_none());history.set_hwinfo(lost.history);
+  mapping.write(&fixture::bytes(100,false,false,false));offline.store(false,Ordering::Release);let baseline=wait(Status::Unverified);assert!(baseline.samples[0].unwrap().value.is_none());assert_ne!(baseline.history[0].unwrap().generation,first.history[0].unwrap().generation);
+  history.set_hwinfo(baseline.history);mapping.write(&fixture::bytes(101,false,false,false));let recovered=wait(Status::Ok);history.set_hwinfo(recovered.history);
+  history.sample(2.,60,&[("cpu_temp",recovered.samples[0].unwrap().value.map(|v|v as f32))]);assert_eq!(history.get("cpu_temp"),vec![41.]);
+  let changed=trofeo_lcd::sensor_policy::validate_text("sensor_source=hwinfo\nsensor_cpu_temp=hwinfo:0x2/0x0/0x3").unwrap();
+  let p=Projection::new(&changed,worker.view().as_ref());history.set_hwinfo(p.history);assert!(history.get("cpu_temp").is_empty());
+  let data=WidgetData{cpu_temp:p.samples[0].unwrap().value.map(|v|v as f32),..Default::default()};
+  assert_eq!(panel(PKind::Cpu,&data,&lhm::Readings::default(),&Settings::default(),&tiles::Settings::default(),&Local::now()).hero,"42");
+  worker.shutdown().unwrap();assert_eq!(worker.view().unwrap().state.snapshot_status(Duration::ZERO),Status::Closed);
+  mapping.read(); // mutex/view resources are still usable after worker shutdown
+ }
+
 }

@@ -158,3 +158,12 @@ pub fn select(
     sensor_policy::validate_text(&next.to_text())?;
     Ok(next)
 }
+
+/// Case-insensitive name/ID filtering with the same type/unit gate as selection.
+pub fn matches_search(entry: &Entry, role: Role, query: &str) -> bool {
+    compatible(entry, role)
+        && (query.is_empty()
+            || format!("{} {} {}", entry.sensor_name, entry.label, entry.identity)
+                .to_lowercase()
+                .contains(&query.to_lowercase()))
+}
