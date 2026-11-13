@@ -48,6 +48,7 @@ pub mod smooth_font;
 pub mod dxgi_capture;
 pub mod background;
 pub mod config;
+pub mod sensor_policy;
 pub mod conf_edit;
 pub mod schema;
 pub mod i18n;

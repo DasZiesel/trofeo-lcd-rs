@@ -72,7 +72,14 @@ impl ConfigFile {
                 .ok_or_else(|| format!("line {}: missing '=' ({raw:?})", n + 1))?;
             let v = strip_value_comment(v.trim());
             let v = v.trim_matches(|c| c == '"' || c == '\'');
-            values.insert(k.trim().to_ascii_lowercase(), v.to_string());
+            let key = k.trim().to_ascii_lowercase();
+            if key.starts_with("sensor_") && !crate::sensor_policy::is_key(&key) {
+                return Err(format!("unknown sensor option {key}"));
+            }
+            if crate::sensor_policy::is_key(&key) && values.contains_key(&key) {
+                return Err(format!("line {}: duplicate sensor option {key}", n + 1));
+            }
+            values.insert(key, v.to_string());
         }
         Ok(Self { values, path: None })
     }

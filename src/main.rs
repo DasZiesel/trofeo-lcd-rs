@@ -166,6 +166,7 @@ const DEFAULT_DEEPCOOL_UPDATE_MS: u64 = 1000;
 
 /// Configuration from command-line arguments (see `parse_args`).
 struct Config {
+    sensor_source: trofeo_lcd::sensor_policy::Settings,
     idle_fps: f32,
     active_fps: f32,
     silence_threshold: f32,
@@ -341,6 +342,10 @@ fn print_help() {
          \x20\x20--background-color <C>   Solid background color (name or #RRGGBB), when there is no image/effect\n\
          \x20\x20--background-dim <0-100> Darkens the background (default: 40)\n\
          \x20\x20--ffmpeg <PATH>      Path to ffmpeg (default: next to the exe/PATH)\n\
+         \x20\x20--sensor-source <auto|native|lhm|hwinfo|bridge>  Default sensor strategy\n\
+         \x20\x20--sensor-<cpu-temp|cpu-fan|case-fan|pump|mb-temp|gpu-temp> <source:selector>\n\
+         \x20\x20--bridge-mode <real|mock> --bridge-service <name>  Reserved Bridge settings\n\
+         \x20\x20  HWiNFO IDs: hwinfo:0x00000001/0x00000000/0x00000002; hwinfo/bridge unavailable in this build\n\
          \x20\x20--lhm-list              Lists what LibreHardwareMonitor reports (fans, temperatures)\n\
          \x20\x20                          and which sensor is used for each role, then exits.\n\
          \x20\x20--lhm <true|false>      Read fan speeds etc. from LibreHardwareMonitor's web\n\
@@ -565,6 +570,11 @@ fn parse_args() -> anyhow::Result<Config> {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            flag if trofeo_lcd::sensor_policy::cli_key(flag).is_some() => {
+                let key = trofeo_lcd::sensor_policy::cli_key(flag).expect("known sensor flag");
+                let value = args.next().ok_or_else(|| anyhow::anyhow!("{flag} requires a value"))?;
+                overrides.push((key, value));
+            }
             "--idle-fps" => idle_fps = next_f32(&mut args, "--idle-fps")?,
             "--active-fps" => active_fps = next_f32(&mut args, "--active-fps")?,
             "--silence-threshold" => {
@@ -723,10 +733,9 @@ fn parse_args() -> anyhow::Result<Config> {
     }
 
     // Priority: defaults < config file < command line.
-    let mut file = ConfigFile::load(config_path.as_deref()).map_err(|e| anyhow::anyhow!(e))?;
-    for (k, v) in &overrides {
-        file.set(k, v);
-    }
+    let file = ConfigFile::load(config_path.as_deref()).map_err(|e| anyhow::anyhow!(e))?;
+    let (file, sensor_source) = trofeo_lcd::sensor_policy::configured(file, &overrides)
+        .map_err(|e| anyhow::anyhow!(e))?;
     if !color_set {
         if let Some(v) = file.get("color") {
             color_mode = parse_color(v)?;
@@ -852,6 +861,7 @@ fn parse_args() -> anyhow::Result<Config> {
     }
 
     Ok(Config {
+        sensor_source,
         config_explicit: config_path.clone(),
         weather_city,
         ticker_source,
@@ -1980,6 +1990,8 @@ fn main() -> anyhow::Result<()> {
     let lhm_list = std::env::args().any(|a| a == "--lhm-list");
     let fps_diag = std::env::args().any(|a| a == "--fps-diag");
     let mut config = parse_args()?;
+    // Fail before diagnostics, preview, USB, GPU or native sensor initialization.
+    config.sensor_source.ensure_available().map_err(|e| anyhow::anyhow!(e))?;
     if fps_diag {
         fps_diag_run(20, config.fps_source, config.fps_driver_divisor);
         return Ok(());
@@ -2129,22 +2141,25 @@ fn main() -> anyhow::Result<()> {
     // Wrapped in `Arc<Mutex<_>>` because it's shared with the DeepCool
     // integration thread (so both screens use a single sensor instance / a single
     // PawnIO handle — instead of opening two).
-    let cpu_sensor = Arc::new(Mutex::new(cpu_sensor::CpuSensor::new()));
+    let cpu_sensor = config.sensor_source.native_cpu().then(|| Arc::new(Mutex::new(cpu_sensor::CpuSensor::new())));
     // Baseline energy counter before the loop starts — used for the first
     // power draw snapshot on the first sysinfo refresh iteration (see the loop section).
-    let mut last_cpu_energy = cpu_sensor.lock().expect("cpu_sensor lock").sample_energy();
+    let mut last_cpu_energy = cpu_sensor.as_ref().map(|s| s.lock().expect("cpu_sensor lock").sample_energy()).unwrap_or(0);
 
     // DeepCool Digital integration: sends CPU temperature/usage/power/frequency to
     // the DeepCool cooler/case display via HID, run on a background
     // thread. If the device isn't found, the thread just retries every few
     // seconds without disrupting the main loop.
-    if config.deepcool_enabled {
+    if config.deepcool_enabled && !config.sensor_source.legacy() {
+        eprintln!("DeepCool disabled: explicit sensor policies require a status-aware display adapter");
+    }
+    if config.deepcool_enabled && config.sensor_source.legacy() {
         println!(
             "DeepCool: active, interval {}ms (disable with --no-deepcool)",
             config.deepcool_update_ms
         );
         deepcool::spawn(
-            Arc::clone(&cpu_sensor),
+            Arc::clone(cpu_sensor.as_ref().expect("legacy CPU source")),
             deepcool::Options {
                 update_ms: config.deepcool_update_ms,
             },
@@ -2318,6 +2333,10 @@ fn main() -> anyhow::Result<()> {
                 config_seen = stamp;
                 match parse_args() {
                     Ok(new_cfg) => {
+                        if let Err(e) = config.sensor_source.validate_reload(&new_cfg.sensor_source) {
+                            report_config_error(&e);
+                            continue;
+                        }
                         let restart_needed = new_cfg.deepcool_enabled != config.deepcool_enabled
                             || new_cfg.fps_monitor != config.fps_monitor
                             || new_cfg.openrgb_device != config.openrgb_device
@@ -2536,19 +2555,22 @@ fn main() -> anyhow::Result<()> {
             }
 
             // CPU temperature + power (AMD Zen1-Zen4 only, see cpu_sensor.rs).
-            let sensor = cpu_sensor.lock().expect("cpu_sensor lock");
-            latest_cpu_temp = sensor.get_temp_c();
-            latest_cpu_power =
-                sensor.calc_power_watts(last_cpu_energy, sysinfo_delta_ms);
-            last_cpu_energy = sensor.sample_energy();
-            drop(sensor);
+            latest_cpu_temp = None;
+            latest_cpu_power = None;
+            if let Some(sensor) = &cpu_sensor {
+                let sensor = sensor.lock().expect("cpu_sensor lock");
+                latest_cpu_temp = sensor.get_temp_c();
+                latest_cpu_power = sensor.calc_power_watts(last_cpu_energy, sysinfo_delta_ms);
+                last_cpu_energy = sensor.sample_energy();
+            }
+            let native_cpu_temp = latest_cpu_temp;
 
             // Real-time CPU frequency (see cpu_freq.rs).
             latest_cpu_mhz = cpu_freq.sample_mhz();
 
             // LibreHardwareMonitor (fans, board / disk temperature; fills CPU temp / power
             // that the built-in sensor cannot read).
-            let mut lhm_now = lhm_link.update(&opts().lhm);
+            let mut lhm_now = if config.sensor_source.lhm() { lhm_link.update(&opts().lhm) } else { lhm::Readings::default() };
             if latest_cpu_temp.is_none() {
                 latest_cpu_temp = lhm_now.cpu_temp;
             }
@@ -2588,6 +2610,17 @@ fn main() -> anyhow::Result<()> {
             // and can be far lower), unless the Windows counter is asked for. With an NVIDIA
             // card the AMD figure (an iGPU's) was cleared above.
             latest_gpu_percent = gpu::pick_usage(config.gpu_usage_source, latest_gpu_percent, latest_gpu_data.activity_pct);
+            let native = [native_cpu_temp.map(f64::from), None, None, None, None, latest_gpu_data.temp_edge_c.map(f64::from)];
+            let lhm_values = [lhm_now.cpu_temp.map(f64::from), lhm_now.cpu_fan.map(f64::from), lhm_now.case_fan.map(f64::from), lhm_now.pump.map(f64::from), lhm_now.mb_temp.map(f64::from), None];
+            let legacy = [latest_cpu_temp.map(f64::from), lhm_values[1], lhm_values[2], lhm_values[3], lhm_values[4], native[5]];
+            let roles = config.sensor_source.resolve(native, lhm_values, legacy);
+            latest_cpu_temp = roles[0].value.map(|v| v as f32);
+            lhm_now.cpu_temp = latest_cpu_temp;
+            lhm_now.cpu_fan = roles[1].value.map(|v| v as u32);
+            lhm_now.case_fan = roles[2].value.map(|v| v as u32);
+            lhm_now.pump = roles[3].value.map(|v| v as u32);
+            lhm_now.mb_temp = roles[4].value.map(|v| v as f32);
+            latest_gpu_data.temp_edge_c = roles[5].value.map(|v| v.round() as i32);
             lhm::set_current(lhm_now);
             deepcool::set_gpu(deepcool::GpuSample {
                 temp_c: latest_gpu_data.temp_edge_c,

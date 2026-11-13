@@ -1286,6 +1286,10 @@ impl App {
     fn save_to(&mut self, path: &Path) -> bool {
         let l = self.lang;
         let text = self.ed.doc.to_text();
+        if let Err(e) = trofeo_lcd::sensor_policy::validate_text(&text) {
+            self.say(format!("Configuration not saved: {e}"), true);
+            return false;
+        }
         // a copy of the previous file, once per session
         if !self.backed_up && path.is_file() {
             let bak = path.with_extension("conf.bak");
