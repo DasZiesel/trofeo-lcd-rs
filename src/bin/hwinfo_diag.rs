@@ -1,13 +1,14 @@
 //! Explicit, bounded SM2 diagnostics. No application or hardware-provider startup.
 use std::io::{self, Write};
 
-const HELP: &str = "hwinfo_diag (--live | --synthetic TOKEN) [--snapshots 1|2|3] [--inventory --acknowledge-inventory]\nDefault: 3 attempts, 100 ms mutex wait each, 250 ms between successful attempts.\nStops on the first error. No file output. Live access requires prior user approval.\nInventory needs separate approval and both inventory flags; it may disclose private data.";
+const HELP: &str = "hwinfo_diag (--live | --synthetic TOKEN) [--snapshots 1|2|3] [--inventory --acknowledge-inventory]\nDefault: 3 attempts, 100 ms mutex wait each, 250 ms between successful attempts.\nStops on the first error. No file output. Live access requires prior user approval.\nInventory needs separate approval and both inventory flags; it may disclose private data.\n--provider-check --acknowledge-provider-read: selects the lowest compatible temperature ID as a diagnostic slot only, checks provider/editor/display in memory, prints status only, uses 3000 ms between at most 3 copies. No inventory output allowed.";
 
 #[derive(Debug, PartialEq, Eq)]
 struct Options {
     synthetic: Option<String>,
     snapshots: u8,
     inventory: bool,
+    provider_check: bool,
 }
 fn parse(args: &[String]) -> Result<Option<Options>, &'static str> {
     if args == ["--help"] {
@@ -18,6 +19,8 @@ fn parse(args: &[String]) -> Result<Option<Options>, &'static str> {
     let mut snapshots = None;
     let mut inventory = false;
     let mut acknowledge = false;
+    let mut provider_check = false;
+    let mut provider_ack = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -42,6 +45,8 @@ fn parse(args: &[String]) -> Result<Option<Options>, &'static str> {
                     _ => return Err("snapshots must be 1, 2 or 3"),
                 });
             }
+            "--provider-check" if !provider_check => provider_check = true,
+            "--acknowledge-provider-read" if !provider_ack => provider_ack = true,
             "--inventory" if !inventory => inventory = true,
             "--acknowledge-inventory" if !acknowledge => acknowledge = true,
             _ => return Err("unknown or repeated argument"),
@@ -53,10 +58,14 @@ fn parse(args: &[String]) -> Result<Option<Options>, &'static str> {
     if inventory != acknowledge {
         return Err("inventory requires both flags and separate approval");
     }
+    if provider_check != provider_ack || (provider_check && inventory) {
+        return Err("provider check needs acknowledgement and forbids inventory output");
+    }
     Ok(Some(Options {
         synthetic,
         snapshots: snapshots.unwrap_or(3),
         inventory,
+        provider_check,
     }))
 }
 
@@ -76,6 +85,9 @@ fn run(options: Options, out: &mut impl Write) -> io::Result<u8> {
         }
     };
     let cancel = AtomicBool::new(false);
+    let mut probe = trofeo_lcd::hwinfo_probe::Probe::new();
+    let mut display_ready = false;
+    let origin = std::time::Instant::now();
     for attempt in 1..=options.snapshots {
         let copy = match transport.capture(&cancel) {
             Ok(value) => value,
@@ -101,6 +113,18 @@ fn run(options: Options, out: &mut impl Write) -> io::Result<u8> {
         writeln!(out, "attempt={attempt} transport=copied decoder=decoded status=Unverified bytes={} version={} revision={} sensors={} readings={} poll_time_raw={} polling_period_raw={:?}",
             copy.bytes().len(), snapshot.header.version, snapshot.header.revision,
             snapshot.sensors.len(), snapshot.readings.len(), snapshot.header.poll_time, snapshot.header.polling_period)?;
+        if options.provider_check {
+            match probe.observe(copy.bytes(), origin.elapsed()) {
+                Ok(report) => {
+                    display_ready |= report.display == trofeo_lcd::sensor_policy::Status::Ok;
+                    writeln!(out,"provider publisher={:?} display={:?} editor_roundtrip={} individual_freshness=Unverified",report.publisher,report.display,report.roundtrip)?;
+                }
+                Err(error) => {
+                    writeln!(out, "provider=error {error}")?;
+                    return Ok(1);
+                }
+            }
+        }
         if options.inventory {
             for reading in &snapshot.readings {
                 // Debug escaping prevents text fields from injecting console control sequences.
@@ -119,8 +143,19 @@ fn run(options: Options, out: &mut impl Write) -> io::Result<u8> {
         drop(snapshot);
         drop(copy);
         if attempt < options.snapshots {
-            thread::sleep(Duration::from_millis(250));
+            thread::sleep(Duration::from_millis(if options.provider_check {
+                3000
+            } else {
+                250
+            }));
         }
+    }
+    if options.provider_check && !display_ready {
+        writeln!(
+            out,
+            "provider=incomplete reason=no_display_eligible_progress"
+        )?;
+        return Ok(2);
     }
     Ok(0)
 }
@@ -164,7 +199,8 @@ mod tests {
             Some(Options {
                 synthetic: None,
                 snapshots: 3,
-                inventory: false
+                inventory: false,
+                provider_check: false,
             })
         );
         assert!(
@@ -177,6 +213,27 @@ mod tests {
     }
     #[test]
     fn limits_are_not_overridable() {
+        assert!(parse(&args(&["--live", "--provider-check"])).is_err());
+        assert!(parse(&args(&["--live", "--acknowledge-provider-read"])).is_err());
+        assert!(parse(&args(&[
+            "--live",
+            "--provider-check",
+            "--acknowledge-provider-read",
+            "--inventory",
+            "--acknowledge-inventory"
+        ]))
+        .is_err());
+        assert!(
+            parse(&args(&[
+                "--synthetic",
+                "test",
+                "--provider-check",
+                "--acknowledge-provider-read"
+            ]))
+            .unwrap()
+            .unwrap()
+            .provider_check
+        );
         for value in ["0", "4", "-1", "4294967295", "01", "x"] {
             assert!(parse(&args(&["--live", "--snapshots", value])).is_err());
         }

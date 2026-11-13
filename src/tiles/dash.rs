@@ -2123,3 +2123,40 @@ mod hwinfo_history_tests {
     }
 
 }
+
+#[cfg(all(test,windows,target_pointer_width="64"))]
+mod hwinfo_pipeline_tests {
+ use super::*;
+ mod fixture {include!(concat!(env!("CARGO_MANIFEST_DIR"),"/tests/support/hwinfo_mapping.rs"));}
+ use trofeo_lcd::{hwinfo_provider::{Frame,State,Options,View,Failure},sensor_policy::{Role,Status,HwinfoSelector},sensor_display::{self,Projection},conf_edit::ConfDoc};
+ use std::{sync::Arc,time::Duration};
+ #[test]
+ fn mapping_to_editor_reload_roles_panel_history_outage_and_new_generation() {
+  let mapping=fixture::Mapping::new();let mut state=State::new(Options::default()).unwrap();
+  let id=HwinfoSelector{sensor_id:1,sensor_instance:0,reading_id:3};
+  mapping.write(&fixture::bytes(1,false,false,false));
+  state.update(Frame::decode(&mapping.read()),Duration::ZERO);
+  let view=View{state:Arc::new(state.clone()),now:Duration::ZERO};
+  let doc=sensor_display::select(&ConfDoc::parse("sensor_source=hwinfo\nunknown=keep\n"),&view,Role::CpuTemp,id).unwrap();
+  let saved=doc.to_text();assert!(!saved.contains("Synthetic"));
+  let loaded=ConfDoc::parse(&saved);assert_eq!(loaded.get("unknown").as_deref(),Some("keep"));
+  let settings=trofeo_lcd::sensor_policy::validate_text(&loaded.to_text()).unwrap();
+  let mut hist=History::new();let mut generation=0;
+  for (time,poll,renamed,reordered,missing,expected) in [(0,1,false,false,false,Status::Unverified),(1,2,true,true,false,Status::Ok),(2,3,true,false,true,Status::NotFound),(3,4,false,true,false,Status::Ok),(8,4,false,true,false,Status::Stale),(9,1,false,false,false,Status::Unverified),(10,2,false,false,false,Status::Ok)] {
+   mapping.write(&fixture::bytes(poll,renamed,reordered,missing));state.update(Frame::decode(&mapping.read()),Duration::from_secs(time));
+   let view=View{state:Arc::new(state.clone()),now:Duration::from_secs(time)};
+   let p=Projection::new(&settings,Some(&view));let sample=p.samples[0].unwrap();assert_eq!(sample.status,expected);
+   hist.set_hwinfo(p.history);
+   if expected!=Status::Ok || generation!=state.generation {assert!(hist.get("cpu_temp").is_empty());}
+   generation=state.generation;
+   let data=WidgetData{cpu_temp:sample.value.map(|v|v as f32),..Default::default()};
+   let panel=panel(PKind::Cpu,&data,&lhm::Readings::default(),&Settings::default(),&tiles::Settings::default(),&Local::now());
+   if expected==Status::Ok {assert_eq!(sample.value,Some(41.));assert_eq!(panel.hero,"41");} else {assert!(sample.value.is_none());assert_ne!(panel.hero,"41");}
+   hist.sample(time as f64,60,&[("cpu_temp",data.cpu_temp)]);
+   let mut fb=Framebuffer::new(trofeo_lcd::Resolution::new(480,1280));p.draw(&mut fb);assert!(fb.as_bytes().iter().any(|&v|v!=0));
+  }
+  state.update(Err(Failure::Unavailable),Duration::from_secs(11));
+  let p=Projection::new(&settings,Some(&View{state:Arc::new(state),now:Duration::from_secs(11)}));hist.set_hwinfo(p.history);
+  assert!(hist.get("cpu_temp").is_empty());assert_eq!(p.samples[0].unwrap().status,Status::Unavailable);
+ }
+}

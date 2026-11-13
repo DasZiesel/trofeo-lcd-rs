@@ -845,3 +845,39 @@ fn provider_worker_uses_synthetic_transport_and_stops_cleanly() {
     stop.send(()).unwrap();
     other.join().unwrap();
 }
+
+mod pipeline_fixture {include!(concat!(env!("CARGO_MANIFEST_DIR"),"/tests/support/hwinfo_mapping.rs"));}
+#[test]
+fn provider_check_is_bounded_private_and_uses_real_selection_projection() {
+ let f=pipeline_fixture::Mapping::new();f.write(&pipeline_fixture::bytes(1,false,false,false));
+ let mut probe=trofeo_lcd::hwinfo_probe::Probe::new();
+ assert_eq!(probe.observe(&f.read(),Duration::ZERO).unwrap().display,Status::Unverified);
+ f.write(&pipeline_fixture::bytes(2,true,true,false));
+ let result=probe.observe(&f.read(),Duration::from_secs(1)).unwrap();assert_eq!(result.display,Status::Ok);assert!(result.roundtrip);
+ let output=std::process::Command::new(env!("CARGO_BIN_EXE_hwinfo_diag")).args(["--synthetic",&f.token,"--snapshots","1","--provider-check","--acknowledge-provider-read"]).output().unwrap();
+ assert_eq!(output.status.code(),Some(2));let text=String::from_utf8(output.stdout).unwrap();
+ assert!(text.contains("editor_roundtrip=true"));
+ for private in ["Renamed","Synthetic","hwinfo:","current=","41.0","42.0"] {assert!(!text.contains(private));}
+ f.write(&pipeline_fixture::bytes(3,false,false,true));
+ assert!(probe.observe(&f.read(),Duration::from_secs(2)).is_err());
+}
+
+#[test]
+fn provider_check_three_copies_reports_progress_without_disclosing_inventory() {
+ let f=pipeline_fixture::Mapping::new();f.write(&pipeline_fixture::bytes(1,false,false,false));
+ let start=Instant::now();
+ let mut child=std::process::Command::new(env!("CARGO_BIN_EXE_hwinfo_diag"))
+  .args(["--synthetic",&f.token,"--snapshots","3","--provider-check","--acknowledge-provider-read"])
+  .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+ thread::sleep(Duration::from_millis(1500));f.write(&pipeline_fixture::bytes(2,true,true,false));
+ thread::sleep(Duration::from_millis(3000));f.write(&pipeline_fixture::bytes(3,false,false,false));
+ while child.try_wait().unwrap().is_none() {
+  if start.elapsed()>Duration::from_secs(12) {child.kill().unwrap();child.wait().unwrap();panic!("diagnostic exceeded synthetic deadline");}
+  thread::sleep(Duration::from_millis(20));
+ }
+ let output=child.wait_with_output().unwrap();assert!(output.status.success());
+ let text=String::from_utf8(output.stdout).unwrap();
+ assert_eq!(text.matches("transport=copied").count(),3);assert_eq!(text.matches("editor_roundtrip=true").count(),3);
+ assert!(text.contains("display=Ok"));assert!(start.elapsed()>=Duration::from_secs(6));
+ for private in ["Renamed","Synthetic","hwinfo:","inventory ","current=","41.0","42.0"] {assert!(!text.contains(private));}
+}

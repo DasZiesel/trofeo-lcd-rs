@@ -1985,3 +1985,30 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod hwinfo_persistence_tests {
+    use super::*;
+    use trofeo_lcd::{hwinfo_provider::{Entry,Frame,State,Options,View},hwinfo_sm2::ReadingType,
+        sensor_policy::{Role,Status,HwinfoSelector},sensor_display};
+    #[test]
+    fn actual_editor_save_backup_and_reload_keep_ids_and_unknown_entries() {
+        // Test-owned directory beside the test executable, never the user's config.
+        let dir=std::env::current_exe().unwrap().parent().unwrap().join(format!("synthetic-editor-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir(&dir).unwrap();let path=dir.join("synthetic.conf");
+        let original="# preserved\nfuture_setting=keep\nsensor_source=hwinfo\n";
+        std::fs::write(&path,original).unwrap();
+        let mut app=App::new(path.clone(),Lang::En,None,None);
+        assert!(app.hwinfo_worker.is_none());assert!(app.preview.rx.is_none());
+        let id=HwinfoSelector{sensor_id:1,sensor_instance:2,reading_id:3};
+        let mut state=State::new(Options::default()).unwrap();state.update(Ok(Frame{poll_time_raw:1,polling_period_raw:Some(2000),entries:vec![Entry{identity:id,sensor_name:"Synthetic".into(),label:"Renamable".into(),reading_type:ReadingType::Temperature,unit:"C".into(),current:40.,numeric_status:Status::Unverified}]}),Duration::ZERO);
+        let view=View{state:std::sync::Arc::new(state),now:Duration::ZERO};
+        app.ed.doc=sensor_display::select(&app.ed.doc,&view,Role::CpuTemp,id).unwrap();app.ed.rev+=1;
+        assert!(app.save_to(&path));assert_eq!(std::fs::read_to_string(path.with_extension("conf.bak")).unwrap(),original);
+        app.load(&path);assert_eq!(app.ed.get("sensor_cpu_temp"),Some(id.to_string()));
+        assert_eq!(app.ed.get("future_setting").as_deref(),Some("keep"));
+        let text=std::fs::read_to_string(&path).unwrap();assert!(!text.contains("Renamable"));assert!(!text.contains("Synthetic"));assert!(text.contains("# preserved"));
+        app.ed.set("sensor_cpu_temp","hwinfo:bad");assert!(!app.save_to(&path));assert_eq!(std::fs::read_to_string(&path).unwrap(),text);
+        // Retain synthetic outputs for inspection; no global settings or app loop used.
+    }
+}
