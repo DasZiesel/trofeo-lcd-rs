@@ -64,7 +64,10 @@ pub enum TransportError {
     Cancelled,
     Abandoned,
     InvalidRegion,
-    MappingTooLarge,
+    AddressOverflow,
+    PayloadTooLarge { required: usize },
+    Header(DecodeError),
+    HeaderChanged,
     Allocation,
     InvalidOptions,
 }
@@ -242,23 +245,59 @@ impl Transport {
             return Err(win_error("map view"));
         }
         let view = View(base);
-        let mut length = 0usize;
-        loop {
-            let address = (base as usize)
-                .checked_add(length)
-                .ok_or(TransportError::InvalidRegion)?;
+        // Stage one: fixed stack storage, only the supported header bytes.
+        let mut prefix = [0u8; 48];
+        view.copy_into(&mut prefix[..44])?;
+        let header_len = hwinfo_sm2::header_size(&prefix[..44]).map_err(TransportError::Header)?;
+        if header_len == 48 {
+            view.copy_into(&mut prefix[..48])?;
+        }
+        let layout = hwinfo_sm2::validate_header(&prefix[..header_len], usize::MAX)
+            .map_err(TransportError::Header)?;
+        let length = layout.required_len;
+        if length > MAX_BUFFER_BYTES {
+            return Err(TransportError::PayloadTooLarge { required: length });
+        }
+        // Retain wire offsets: the bounded prefix includes any section gaps.
+        // Check its entire readable extent before payload allocation/copy.
+        view.validate_range(length)?;
+        if cancel.load(Ordering::Acquire) {
+            return Err(TransportError::Cancelled);
+        }
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(length)
+            .map_err(|_| TransportError::Allocation)?;
+        bytes.resize(length, 0);
+        view.copy_into(&mut bytes)?;
+        if bytes.get(..header_len) != Some(&prefix[..header_len]) {
+            return Err(TransportError::HeaderChanged);
+        }
+        if cancel.load(Ordering::Acquire) {
+            return Err(TransportError::Cancelled);
+        }
+        Ok(CopiedSnapshot { bytes })
+    }
+}
+
+impl View {
+    // Only walk the requested bounded prefix, not all trailing mapping capacity.
+    fn validate_range(&self, length: usize) -> Result<(), TransportError> {
+        let base = self.0 as usize;
+        let end = base
+            .checked_add(length)
+            .ok_or(TransportError::AddressOverflow)?;
+        let mut cursor = base;
+        while cursor < end {
             let mut info = MemoryInfo::default();
-            // SAFETY: query does not dereference address; output is correct x64 ABI.
-            if unsafe { VirtualQuery(address as *const c_void, &mut info, size_of::<MemoryInfo>()) }
+            // SAFETY: VirtualQuery inspects an address; output has checked x64 ABI.
+            if unsafe { VirtualQuery(cursor as *const c_void, &mut info, size_of::<MemoryInfo>()) }
                 != size_of::<MemoryInfo>()
             {
                 return Err(win_error("query view"));
             }
-            if info.allocation_base != base {
-                break;
-            }
-            // Reject guarded, reserved, executable or otherwise unexpected regions.
-            if info.base as usize != address
+            if info.allocation_base != self.0
+                || info.base as usize != cursor
                 || info.region_size == 0
                 || info.state != 0x1000
                 || info.kind != 0x40000
@@ -266,46 +305,32 @@ impl Transport {
             {
                 return Err(TransportError::InvalidRegion);
             }
-            length = length
+            cursor = cursor
                 .checked_add(info.region_size)
-                .ok_or(TransportError::MappingTooLarge)?;
-            if length > MAX_BUFFER_BYTES {
-                return Err(TransportError::MappingTooLarge);
-            }
+                .ok_or(TransportError::AddressOverflow)?;
         }
-        if length < 44 {
-            return Err(TransportError::InvalidRegion);
-        }
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(length)
-            .map_err(|_| TransportError::Allocation)?;
-        bytes.resize(length, 0);
-        if cancel.load(Ordering::Acquire) {
-            return Err(TransportError::Cancelled);
-        }
+        Ok(())
+    }
+    fn copy_into(&self, bytes: &mut [u8]) -> Result<(), TransportError> {
+        self.validate_range(bytes.len())?;
         let mut read = 0;
-        // SAFETY: no Rust reference into concurrently writable shared memory is made.
-        // The OS checks accessibility and copies into an owned, initialized buffer.
-        // Only this process's own view is read; no foreign process handle is opened.
-        let ok = unsafe {
+        // SAFETY: own live view, OS-checked source, initialized exclusively owned
+        // destination. No Rust reference is made into shared memory.
+        if unsafe {
             ReadProcessMemory(
                 GetCurrentProcess(),
-                view.0,
+                self.0,
                 bytes.as_mut_ptr().cast(),
-                length,
+                bytes.len(),
                 &mut read,
             )
-        };
-        if ok == 0 {
+        } == 0
+        {
             return Err(win_error("copy view"));
         }
-        if read != length {
+        if read != bytes.len() {
             return Err(TransportError::InvalidRegion);
         }
-        if cancel.load(Ordering::Acquire) {
-            return Err(TransportError::Cancelled);
-        }
-        Ok(CopiedSnapshot { bytes })
+        Ok(())
     }
 }

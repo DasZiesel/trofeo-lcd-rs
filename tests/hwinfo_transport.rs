@@ -160,8 +160,8 @@ fn owned_copy_decodes_after_publisher_destruction() {
 fn decoder_error_is_separate_and_lock_released() {
     let f = Fixture::new(48);
     assert!(matches!(
-        capture(&f).decode(),
-        Err(DecodeError::Signature(0))
+        f.transport(100).capture(&AtomicBool::new(false)),
+        Err(TransportError::Header(DecodeError::Signature(0)))
     ));
     f.write(&header(9));
     assert!(capture(&f).decode().is_ok());
@@ -172,21 +172,21 @@ fn invalid_offsets_cannot_escape_mapping() {
     let mut data = header(0);
     data[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
     f.write(&data);
-    assert!(capture(&f).decode().is_err());
+    assert!(matches!(
+        f.transport(100).capture(&AtomicBool::new(false)),
+        Err(TransportError::PayloadTooLarge { .. })
+    ));
 }
 #[test]
-fn oversized_mapping_rejected_and_objects_released() {
-    let f = Fixture::new(MAX_BUFFER_BYTES + 4096);
-    assert_eq!(
-        f.transport(10)
-            .capture(&AtomicBool::new(false))
-            .unwrap_err(),
-        TransportError::MappingTooLarge
-    );
-    assert_eq!(unsafe { WaitForSingleObject(f.mutex, 0) }, 0);
-    unsafe {
-        ReleaseMutex(f.mutex);
-    }
+fn large_mapping_small_payload_is_accepted() {
+    let f = Fixture::new(MAX_BUFFER_BYTES * 2);
+    f.write(&header(7));
+    let copy = capture(&f);
+    assert_eq!(copy.bytes().len(), 48);
+    assert_eq!(copy.decode().unwrap().header.poll_time, 7);
+    let (stop, worker) = hold(f.token.clone(), false);
+    stop.send(()).unwrap();
+    worker.join().unwrap();
 }
 #[test]
 fn reserved_uncommitted_mapping_rejected() {
@@ -579,13 +579,13 @@ fn diagnostic_inventory_is_separately_gated_and_escaped() {
     assert!(!text.contains("SECRET"));
 }
 #[test]
-fn diagnostic_stops_after_first_decoder_error() {
+fn diagnostic_stops_after_first_header_error() {
     let f = Fixture::new(48);
     let output = diagnostic(&f, &[]);
     assert_eq!(output.status.code(), Some(1));
     let text = String::from_utf8(output.stdout).unwrap();
     assert_eq!(text.lines().count(), 1);
-    assert!(text.contains("decoder=error error=Signature(0)"));
+    assert!(text.contains("transport=error error=Header(Signature(0)) decoder=not_run"));
 }
 #[test]
 fn diagnostic_timeout_does_not_retry() {
@@ -629,4 +629,164 @@ fn diagnostic_missing_mapping_is_transport_error() {
     assert_eq!(text.lines().count(), 1);
     assert!(text.contains("NotFound"));
     assert!(text.contains("decoder=not_run"));
+}
+
+fn rejected_header(edits: &[(usize, u32)]) -> TransportError {
+    let f = Fixture::new(4096);
+    let mut data = header(0);
+    for &(at, value) in edits {
+        data[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    f.write(&data);
+    let error = f
+        .transport(100)
+        .capture(&AtomicBool::new(false))
+        .unwrap_err();
+    let (stop, worker) = hold(f.token.clone(), false);
+    stop.send(()).unwrap();
+    worker.join().unwrap();
+    error
+}
+#[test]
+fn preflight_rejects_signature_versions_strides_counts() {
+    for (edits, expected) in [
+        (vec![(0, 0)], DecodeError::Signature(0)),
+        (
+            vec![(4, 99)],
+            DecodeError::UnsupportedLayout {
+                version: 99,
+                revision: 1,
+            },
+        ),
+        (
+            vec![(8, 99)],
+            DecodeError::UnsupportedLayout {
+                version: 2,
+                revision: 99,
+            },
+        ),
+        (vec![(24, 1)], DecodeError::ElementSize),
+        (vec![(28, 4097)], DecodeError::ResourceLimit),
+    ] {
+        assert_eq!(rejected_header(&edits), TransportError::Header(expected));
+    }
+}
+#[test]
+fn preflight_rejects_overflow_and_overlaps() {
+    assert_eq!(
+        rejected_header(&[(20, u32::MAX), (28, 1)]),
+        TransportError::Header(DecodeError::ArithmeticOverflow)
+    );
+    assert_eq!(
+        rejected_header(&[(28, 1), (40, 1)]),
+        TransportError::Header(DecodeError::OverlappingSections)
+    );
+    assert_eq!(
+        rejected_header(&[(20, 20)]),
+        TransportError::Header(DecodeError::InvalidSection)
+    );
+    // Huge multipliers are rejected by count/stride limits before multiplication.
+    assert_eq!(
+        rejected_header(&[(28, u32::MAX)]),
+        TransportError::Header(DecodeError::ResourceLimit)
+    );
+}
+#[test]
+fn preflight_distinguishes_payload_limit_from_view_bounds() {
+    assert_eq!(
+        rejected_header(&[(20, (MAX_BUFFER_BYTES + 1) as u32)]),
+        TransportError::PayloadTooLarge {
+            required: MAX_BUFFER_BYTES + 1
+        }
+    );
+    assert_eq!(
+        rejected_header(&[(20, 8192), (28, 1)]),
+        TransportError::InvalidRegion
+    );
+    assert_eq!(
+        rejected_header(&[(20, 3900), (28, 1)]),
+        TransportError::InvalidRegion
+    );
+}
+#[test]
+fn supported_header_sizes_and_reversed_sections() {
+    for (version, revision, sensor_size, reading_size, header_len) in [
+        (1u32, 0u32, 264u32, 316u32, 44usize),
+        (1, 1, 264, 316, 48),
+        (2, 1, 392, 460, 48),
+    ] {
+        let f = Fixture::new(4096);
+        let mut data = header(9);
+        for (at, n) in [
+            (4, version),
+            (8, revision),
+            (20, header_len as u32),
+            (24, sensor_size),
+            (32, header_len as u32),
+            (36, reading_size),
+        ] {
+            data[at..at + 4].copy_from_slice(&n.to_le_bytes());
+        }
+        f.write(&data);
+        let copy = capture(&f);
+        assert_eq!(copy.bytes().len(), header_len);
+        assert!(copy.decode().is_ok());
+    }
+    let f = Fixture::new(4096);
+    let mut data = header(9);
+    data.resize(1000, 0);
+    for (at, n) in [(20, 600u32), (28, 1), (32, 48), (40, 1)] {
+        data[at..at + 4].copy_from_slice(&n.to_le_bytes());
+    }
+    f.write(&data);
+    let copy = capture(&f);
+    assert_eq!(copy.bytes().len(), 992);
+    assert!(copy.decode().is_ok());
+}
+#[test]
+fn valid_header_bad_payload_remains_decoder_error() {
+    let f = Fixture::new(900);
+    let mut data = header(0);
+    data.resize(900, 0);
+    for (at, n) in [(28, 1u32), (32, 440), (40, 1), (444, 99)] {
+        data[at..at + 4].copy_from_slice(&n.to_le_bytes());
+    }
+    f.write(&data);
+    assert!(matches!(
+        capture(&f).decode(),
+        Err(DecodeError::InvalidSensorIndex(99))
+    ));
+    let output = diagnostic(&f, &[]);
+    assert_eq!(output.status.code(), Some(1));
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(text.lines().count(), 1);
+    assert!(text.contains("decoder=error error=InvalidSensorIndex(99)"));
+}
+#[test]
+fn repeated_preflight_failures_release_all_resources() {
+    let f = Fixture::new(4096);
+    for _ in 0..100 {
+        assert!(matches!(
+            f.transport(100).capture(&AtomicBool::new(false)),
+            Err(TransportError::Header(_))
+        ));
+    }
+    let (stop, worker) = hold(f.token.clone(), false);
+    stop.send(()).unwrap();
+    worker.join().unwrap();
+    let map = f.map_name();
+    let mutex = f.mutex_name();
+    drop(f);
+    unsafe {
+        let m = OpenFileMappingW(4, 0, map.as_ptr());
+        if !m.is_null() {
+            CloseHandle(m);
+            panic!("mapping leak");
+        }
+        let m = OpenMutexW(0x00100001, 0, mutex.as_ptr());
+        if !m.is_null() {
+            CloseHandle(m);
+            panic!("mutex leak");
+        }
+    }
 }

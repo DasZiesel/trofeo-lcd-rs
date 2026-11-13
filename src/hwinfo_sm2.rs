@@ -238,26 +238,36 @@ fn reserve<T>(vec: &mut Vec<T>, count: u32) -> Result<(), DecodeError> {
         .map_err(|_| DecodeError::Allocation)
 }
 
-/// Decode one bounded snapshot. Success means structurally decoded, never live.
-/// Supported layouts: (version, revision) = (1,0), (1,1), (2,1), exact strides.
-/// (2,0) is rejected: the documented UTF-8 version postdates revision 1.
-/// Gaps, reversed disjoint sections and trailing bytes are allowed; overlaps are not.
-pub fn decode(data: &[u8]) -> Result<Snapshot<'_>, DecodeError> {
-    if data.len() > MAX_BUFFER_BYTES {
-        return Err(DecodeError::InputTooLarge);
-    }
+// Shared structural preflight, also used before any transport payload allocation.
+fn layout_spec(data: &[u8]) -> Result<(u32, u32, (usize, u32, u32)), DecodeError> {
     let signature = u32_at(data, 0)?;
     if signature != ACTIVE_SIGNATURE {
         return Err(DecodeError::Signature(signature));
     }
     let version = u32_at(data, 4)?;
     let revision = u32_at(data, 8)?;
-    let (header_size, sensor_size, reading_size) = match (version, revision) {
+    let sizes = match (version, revision) {
         (1, 0) => (44, 264, 316),
         (1, 1) => (48, 264, 316),
         (2, 1) => (48, 392, 460),
         _ => return Err(DecodeError::UnsupportedLayout { version, revision }),
     };
+    Ok((version, revision, sizes))
+}
+pub(crate) fn header_size(data: &[u8]) -> Result<usize, DecodeError> {
+    Ok(layout_spec(data)?.2 .0)
+}
+pub(crate) struct SnapshotLayout {
+    pub header: Header,
+    pub sensors: Range<usize>,
+    pub readings: Range<usize>,
+    pub required_len: usize,
+}
+pub(crate) fn validate_header(
+    data: &[u8],
+    available: usize,
+) -> Result<SnapshotLayout, DecodeError> {
+    let (version, revision, (header_size, sensor_size, reading_size)) = layout_spec(data)?;
     data.get(..header_size).ok_or(DecodeError::Truncated)?;
     let header = Header {
         version,
@@ -277,11 +287,35 @@ pub fn decode(data: &[u8]) -> Result<Snapshot<'_>, DecodeError> {
     if header.sensors.count > MAX_SENSORS || header.readings.count > MAX_READINGS {
         return Err(DecodeError::ResourceLimit);
     }
-    let sr = extent(header.sensors, header_size, data.len())?;
-    let rr = extent(header.readings, header_size, data.len())?;
+    let sr = extent(header.sensors, header_size, available)?;
+    let rr = extent(header.readings, header_size, available)?;
     if !sr.is_empty() && !rr.is_empty() && sr.start < rr.end && rr.start < sr.end {
         return Err(DecodeError::OverlappingSections);
     }
+    let required_len = header_size.max(sr.end).max(rr.end);
+    Ok(SnapshotLayout {
+        header,
+        sensors: sr,
+        readings: rr,
+        required_len,
+    })
+}
+
+/// Decode one bounded snapshot. Success means structurally decoded, never live.
+/// Supported layouts: (version, revision) = (1,0), (1,1), (2,1), exact strides.
+/// (2,0) is rejected: the documented UTF-8 version postdates revision 1.
+/// Gaps, reversed disjoint sections and trailing bytes are allowed; overlaps are not.
+pub fn decode(data: &[u8]) -> Result<Snapshot<'_>, DecodeError> {
+    if data.len() > MAX_BUFFER_BYTES {
+        return Err(DecodeError::InputTooLarge);
+    }
+    let layout = validate_header(data, data.len())?;
+    let header = layout.header;
+    let version = header.version;
+    let sensor_size = header.sensors.element_size;
+    let reading_size = header.readings.element_size;
+    let sr = layout.sensors;
+    let rr = layout.readings;
     let mut sensors = Vec::new();
     let mut readings = Vec::new();
     reserve(&mut sensors, header.sensors.count)?;
