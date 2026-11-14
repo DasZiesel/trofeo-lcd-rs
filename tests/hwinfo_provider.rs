@@ -40,7 +40,7 @@ fn sec(n: u64) -> Duration {
     Duration::from_secs(n)
 }
 fn state() -> State {
-    State::new(Options::default()).unwrap()
+    State::new(Options { poll_interval: Duration::from_millis(500), stale_after: sec(5) }).unwrap()
 }
 #[test]
 fn progress_is_not_reading_quality_and_identical_snapshots_never_refresh() {
@@ -581,4 +581,32 @@ fn editor_search_respects_type_unit_ids_case_and_renames() {
     assert!(!matches_search(&e, Role::CpuTemp, "Temperature"));
     e.unit = "F".into();
     assert!(!matches_search(&e, Role::CpuTemp, "renamed"));
+}
+
+
+#[test]
+fn configured_freshness_boundaries_and_reconnection() {
+    let options=validate_text("hwinfo_poll_interval_ms=2000\nhwinfo_stale_timeout_ms=10000").unwrap().hwinfo_options;
+    let mut s=State::new(options).unwrap();
+    s.update(Ok(frame(1)),sec(0));assert_eq!(s.snapshot_status(sec(0)),Status::Unverified);
+    s.update(Ok(frame(2)),sec(2));assert_eq!(s.snapshot_status(sec(2)),Status::Ok);
+    for time in [4,6,8,10] {s.update(Ok(frame(2)),sec(time));}
+    assert_eq!(s.last_progress_at,Some(sec(2)));
+    assert_eq!(s.snapshot_status(Duration::from_millis(11999)),Status::Ok);
+    assert_eq!(s.snapshot_status(sec(12)),Status::Stale);
+    assert!(s.resolve(Role::CpuTemp,id(3),sec(12)).sample.value.is_none());
+    s.update(Err(Failure::Unavailable),sec(12));assert_eq!(s.snapshot_status(sec(12)),Status::Unavailable);
+    s.update(Ok(frame(3)),sec(14));assert_eq!(s.snapshot_status(sec(14)),Status::Unverified);
+    s.update(Ok(frame(4)),sec(16));assert_eq!(s.snapshot_status(sec(16)),Status::Ok);
+}
+#[test]
+fn configured_worker_waits_and_shutdown_interrupts_long_poll() {
+    let options=validate_text("hwinfo_poll_interval_ms=10000\nhwinfo_stale_timeout_ms=20000").unwrap().hwinfo_options;
+    let calls=Arc::new(AtomicUsize::new(0));let observed=calls.clone();
+    let (tx,rx)=std::sync::mpsc::channel();
+    let mut worker=Worker::spawn_with(options,move |_| {observed.fetch_add(1,Ordering::SeqCst);tx.send(()).unwrap();Ok(frame(1))}).unwrap();
+    rx.recv_timeout(sec(3)).unwrap();
+    assert!(rx.recv_timeout(Duration::from_millis(250)).is_err());
+    let start=Instant::now();worker.shutdown();assert!(start.elapsed()<sec(2));
+    assert_eq!(calls.load(Ordering::SeqCst),1);
 }

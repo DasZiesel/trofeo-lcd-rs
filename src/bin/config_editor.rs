@@ -1207,6 +1207,7 @@ struct App {
     lcd_test: LcdTest,
     hwinfo_worker: Option<trofeo_lcd::hwinfo_provider::Worker>,
     hwinfo_search: String,
+    hwinfo_options: Result<trofeo_lcd::hwinfo_provider::Options, String>,
     sensor_editor_only: bool,
 }
 
@@ -1243,9 +1244,12 @@ impl App {
             lcd_test: LcdTest::new(),
             hwinfo_worker: None,
             hwinfo_search: String::new(),
+            hwinfo_options: Err("Editor initialization incomplete".into()),
             sensor_editor_only: false,
         };
         app.load(&path);
+        app.hwinfo_options = trofeo_lcd::config::ConfigFile::parse(&app.ed.doc.to_text())
+            .and_then(|f| trofeo_lcd::hwinfo_provider::Options::from_config(&f));
         app
     }
 
@@ -1549,16 +1553,28 @@ impl App {
         ui.label(RichText::new(tr(l, "(n) = settings you changed", "(n) = impostazioni che hai cambiato")).weak().small());
     }
 
+    fn inventory_options(&self) -> Result<trofeo_lcd::hwinfo_provider::Options, String> {
+        trofeo_lcd::sensor_policy::validate_text(&self.ed.doc.to_text())?;
+        self.hwinfo_options.clone()
+    }
+
     fn hwinfo_picker(&mut self, ui: &mut egui::Ui) {
         use trofeo_lcd::{hwinfo_provider::Worker, sensor_policy::{ROLES, KEYS}, sensor_display};
         ui.collapsing("HWiNFO sensor assignments (restart required)", |ui| {
             ui.label("Reads HWiNFO Shared Memory only when started here. Names stay in memory; saved bindings contain IDs only.");
             ui.label("Display values require publisher progress. Individual reading freshness is unverified.");
+            match &self.hwinfo_options {
+                Ok(o) => { ui.label(format!("Active timing: poll {} ms / stale {} ms. Saved timing changes require editor restart (including after inventory stop/start).", o.poll_interval.as_millis(), o.stale_after.as_millis())); },
+                Err(e) => { ui.label(format!("Startup timing invalid: {e}. Correct, save and restart editor.")); },
+            }
+            if let Err(e) = trofeo_lcd::sensor_policy::validate_text(&self.ed.doc.to_text()) {
+                ui.colored_label(egui::Color32::RED, e);
+            }
             if self.hwinfo_worker.is_some() {
                 if ui.button("Stop inventory reading").clicked() { self.hwinfo_worker = None; }
             } else if ui.button("Read HWiNFO inventory").clicked() {
                 #[cfg(all(windows, target_pointer_width = "64"))]
-                match Worker::start(Default::default()) {
+                match self.inventory_options().and_then(Worker::start) {
                     Ok(w) => self.hwinfo_worker = Some(w),
                     Err(e) => self.say(format!("HWiNFO unavailable: {e:?}"), true),
                 }
@@ -2037,6 +2053,18 @@ mod hwinfo_persistence_tests {
         assert_eq!(app.ed.get("future_setting").as_deref(),Some("keep"));
         let text=std::fs::read_to_string(&path).unwrap();assert!(!text.contains("Renamable"));assert!(!text.contains("Synthetic"));assert!(text.contains("# preserved"));
         app.ed.set("sensor_cpu_temp","hwinfo:bad");assert!(!app.save_to(&path));assert_eq!(std::fs::read_to_string(&path).unwrap(),text);
+        app.load(&path);
+        let startup=app.inventory_options().unwrap();
+        app.ed.set("hwinfo_poll_interval_ms","3000");app.ed.set("hwinfo_stale_timeout_ms","12000");
+        assert!(app.save_to(&path));app.load(&path);
+        assert_eq!(app.inventory_options().unwrap(),startup);
+        let reopened=App::new(path.clone(),Lang::En,None,None);
+        assert_eq!(reopened.inventory_options().unwrap().poll_interval.as_millis(),3000);
+        assert_eq!(reopened.inventory_options().unwrap().stale_after.as_millis(),12000);
+        let valid=std::fs::read_to_string(&path).unwrap();
+        app.ed.set("hwinfo_stale_timeout_ms","5999");
+        assert!(app.inventory_options().is_err());assert!(!app.save_to(&path));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(),valid);
         // Retain synthetic outputs for inspection; no global settings or app loop used.
     }
 }

@@ -2132,7 +2132,7 @@ mod hwinfo_pipeline_tests {
  use std::{sync::Arc,time::Duration};
  #[test]
  fn mapping_to_editor_reload_roles_panel_history_outage_and_new_generation() {
-  let mapping=fixture::Mapping::new();let mut state=State::new(Options::default()).unwrap();
+  let mapping=fixture::Mapping::new();let mut state=State::new(Options{poll_interval:Duration::from_millis(500),stale_after:Duration::from_secs(5)}).unwrap();
   let id=HwinfoSelector{sensor_id:1,sensor_instance:0,reading_id:3};
   mapping.write(&fixture::bytes(1,false,false,false));
   state.update(Frame::decode(&mapping.read()),Duration::ZERO);

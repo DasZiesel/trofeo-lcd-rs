@@ -711,6 +711,14 @@ pub fn fields() -> Vec<Field> {
             .help("Source: auto/native/lhm/hwinfo/bridge. Binding: source:alias or hwinfo:0x00000001/0x00000000/0x00000002. HWiNFO requires Windows x64 and explicit IDs; reading quality remains unverified. Bridge is unavailable in this build.",
                   "Fonte: auto/native/lhm/hwinfo/bridge. Selettore: source:alias o hwinfo:0x00000001/0x00000000/0x00000002. HWiNFO richiede Windows x64 e ID espliciti; la qualita dei valori resta non verificata. Bridge non disponibile in questa versione."));
     }
+    for (key, label, min, max, default) in [
+        ("hwinfo_poll_interval_ms", "HWiNFO poll interval (ms)", 100, 10000, "2000"),
+        ("hwinfo_stale_timeout_ms", "HWiNFO stale timeout (ms)", 200, 60000, "10000"),
+    ] {
+        add(Field::new(key, "lhm", label, label, int(min, max)).group("sensor_sources").def(default).restart()
+            .help("Stale timeout must be at least twice the poll interval. Restart the application/editor to apply. Does not change HWiNFO settings.",
+                  "Timeout almeno doppio dell'intervallo. Riavviare applicazione/editor. Non modifica HWiNFO."));
+    }
     // ---- LibreHardwareMonitor
     add(Field::new("lhm", "lhm", "Read fans and sensors from LibreHardwareMonitor", "Leggi ventole e sensori da LibreHardwareMonitor", Bool)
         .def("true")

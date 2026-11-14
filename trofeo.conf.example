@@ -561,3 +561,9 @@ language = en
 # Reserved bridge configuration (no IPC client in this build):
 # bridge_mode = mock
 # bridge_service = TrofeoSensorService
+
+# HWiNFO Shared Memory reader timing (restart application/editor to apply).
+# Does not alter HWiNFO's own sensor polling. Auto does not enable HWiNFO.
+# Poll: 100..10000 ms. Stale: at least 2 * poll, at most 60000 ms.
+# hwinfo_poll_interval_ms = 2000
+# hwinfo_stale_timeout_ms = 10000

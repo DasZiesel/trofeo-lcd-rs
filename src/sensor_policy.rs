@@ -188,13 +188,14 @@ impl Sample {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
+    pub hwinfo_options: crate::hwinfo_provider::Options,
     pub source: Source,
     pub mode: Option<Mode>,
     pub roles: [Binding; 6],
 }
 
 pub fn is_key(key: &str) -> bool {
-    key == "sensor_source" || key == "bridge_mode" || key == "bridge_service" || KEYS.contains(&key)
+    matches!(key, "hwinfo_poll_interval_ms" | "hwinfo_stale_timeout_ms") || key == "sensor_source" || key == "bridge_mode" || key == "bridge_service" || KEYS.contains(&key)
 }
 pub fn cli_key(arg: &str) -> Option<String> {
     let key = arg.strip_prefix("--")?.replace('-', "_");
@@ -284,6 +285,7 @@ impl Settings {
             }
         }
         let value = Self {
+            hwinfo_options: crate::hwinfo_provider::Options::from_config(f)?,
             source,
             mode,
             roles,
@@ -350,7 +352,7 @@ impl Settings {
     pub fn validate_reload(&self, next: &Self) -> Result<(), String> {
         next.ensure_available()?;
         if self != next {
-            return Err("sensor source or bindings changed; restart required (keeping previous configuration)".into());
+            return Err("sensor source, bindings or HWiNFO timing changed; restart required (keeping previous configuration)".into());
         }
         Ok(())
     }

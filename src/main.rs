@@ -2150,7 +2150,7 @@ fn main() -> anyhow::Result<()> {
     // Auto never starts it; dropping it on exit requests cancellation and joins.
     #[cfg(all(windows, target_pointer_width="64"))]
     let hwinfo_worker = if config.sensor_source.hwinfo() {
-        Some(trofeo_lcd::hwinfo_provider::Worker::start(Default::default()).map_err(|e| anyhow::anyhow!(e))?)
+        Some(trofeo_lcd::hwinfo_provider::Worker::start(config.sensor_source.hwinfo_options).map_err(|e| anyhow::anyhow!(e))?)
     } else { None };
     #[cfg(not(all(windows, target_pointer_width="64")))]
     let hwinfo_worker: Option<trofeo_lcd::hwinfo_provider::Worker> = None;

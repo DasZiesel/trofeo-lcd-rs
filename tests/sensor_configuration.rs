@@ -237,3 +237,47 @@ fn all_roles_allow_persisted_id_triplets_without_discovery() {
         cfg!(all(windows, target_pointer_width = "64"))
     );
 }
+
+
+#[test]
+fn hwinfo_timing_defaults_bounds_and_strict_numbers() {
+    use std::time::Duration;
+    let d=settings("").hwinfo_options;
+    assert_eq!(d.poll_interval,Duration::from_millis(2000));
+    assert_eq!(d.stale_after,Duration::from_millis(10000));
+    for (poll,stale) in [(100,200),(2000,4000),(10000,20000),(10000,60000)] {
+        assert!(validate_text(&format!("hwinfo_poll_interval_ms={poll}\nhwinfo_stale_timeout_ms={stale}")).is_ok());
+    }
+    for text in ["hwinfo_poll_interval_ms=99", "hwinfo_poll_interval_ms=10001", "hwinfo_poll_interval_ms=6000", "hwinfo_stale_timeout_ms=3999", "hwinfo_stale_timeout_ms=60001", "hwinfo_stale_timeout_ms=0", "hwinfo_poll_interval_ms=2000\nhwinfo_poll_interval_ms=2000"] {
+        assert!(validate_text(text).is_err(),"{text}");
+    }
+    for key in ["hwinfo_poll_interval_ms","hwinfo_stale_timeout_ms"] {
+        for bad in ["", "-1", "+2000", "2.0", "1e3", "NaN", "inf", "0x800", "18446744073709551616"] {
+            assert!(validate_text(&format!("{key}={bad}")).is_err(),"{key}={bad}");
+        }
+    }
+}
+#[test]
+fn timing_schema_roundtrip_cli_precedence_and_restart() {
+    let mut doc=ConfDoc::parse("future_setting=keep\nhwinfo_poll_interval_ms=2000\nhwinfo_stale_timeout_ms=10000\n");
+    doc.set("hwinfo_poll_interval_ms","3000");
+    doc.set("hwinfo_stale_timeout_ms","12000");
+    let file=ConfigFile::parse(&doc.to_text()).unwrap();
+    let before=Settings::parse(&file).unwrap();
+    assert_eq!(file.get("future_setting"),Some("keep"));
+    let (_,after)=configured(file,&[(cli_key("--hwinfo-poll-interval-ms").unwrap(),"4000".into())]).unwrap();
+    assert_eq!(after.hwinfo_options.poll_interval.as_millis(),4000);
+    assert!(before.validate_reload(&after).unwrap_err().contains("restart"));
+    assert!(before.validate_reload(&before).is_ok());
+    let only_stale=settings("hwinfo_poll_interval_ms=3000\nhwinfo_stale_timeout_ms=13000");
+    assert!(before.validate_reload(&only_stale).is_err());
+    for f in trofeo_lcd::schema::fields().into_iter().filter(|f| f.key.starts_with("hwinfo_")) {
+        assert!(f.restart);
+        assert_eq!(settings(&format!("{}={}",f.key,f.default)).hwinfo_options,settings("").hwinfo_options);
+    }
+    for source in ["auto","native","lhm","bridge"] {
+        let base=settings(&format!("sensor_source={source}\nbridge_mode=mock"));
+        let changed=settings(&format!("sensor_source={source}\nbridge_mode=mock\nhwinfo_poll_interval_ms=1000"));
+        assert_eq!(base.roles,changed.roles);assert!(!changed.hwinfo());
+    }
+}

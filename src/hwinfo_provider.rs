@@ -138,7 +138,7 @@ pub struct Resolution {
     pub sample: Sample,
     pub diagnostic: Diagnostic,
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Options {
     pub poll_interval: Duration,
     pub stale_after: Duration,
@@ -146,12 +146,29 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
-            poll_interval: Duration::from_millis(500),
-            stale_after: Duration::from_secs(5),
+            poll_interval: Duration::from_millis(2000),
+            stale_after: Duration::from_millis(10000),
         }
     }
 }
 impl Options {
+    /// Strict decimal configuration; the same bounds govern runtime and editor.
+    pub fn from_config(file: &crate::config::ConfigFile) -> Result<Self, String> {
+        let defaults = Self::default();
+        let read = |key: &str, fallback: Duration| -> Result<Duration, String> {
+            let Some(raw) = file.get(key) else { return Ok(fallback) };
+            if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(format!("{key}: expected unsigned decimal milliseconds"));
+            }
+            let ms = raw.parse::<u64>().map_err(|_| format!("{key}: milliseconds overflow"))?;
+            Ok(Duration::from_millis(ms))
+        };
+        Self {
+            poll_interval: read("hwinfo_poll_interval_ms", defaults.poll_interval)?,
+            stale_after: read("hwinfo_stale_timeout_ms", defaults.stale_after)?,
+        }.validate().map_err(|_| "HWiNFO timing: poll must be 100..10000 ms; stale must be at least twice poll and at most 60000 ms".into())
+    }
+
     pub fn validate(self) -> Result<Self, &'static str> {
         if self.poll_interval < Duration::from_millis(100)
             || self.poll_interval > Duration::from_secs(10)
