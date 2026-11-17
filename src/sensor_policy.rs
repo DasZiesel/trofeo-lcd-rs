@@ -213,7 +213,7 @@ pub fn configured(
     Ok((file, settings))
 }
 pub fn validate_text(text: &str) -> Result<Settings, String> {
-    Settings::parse(&ConfigFile::parse(text)?)
+    Settings::parse(&ConfigFile::parse_raw(text)?)
 }
 
 impl Settings {

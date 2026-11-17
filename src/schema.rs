@@ -126,9 +126,13 @@ pub const SECTIONS: &[(&str, &str, &str)] = &[
     ("music", "Music card", "Scheda musica"),
     ("game", "Pixel game", "Mini gioco"),
     ("online", "Weather and news", "Meteo e notizie"),
+    ("profiles", "Profiles", "Profili"),
+    ("builder", "Layout builder", "Costruttore di layout"),
     ("system", "System", "Sistema"),
+    ("share", "Share your design", "Condividi il tuo design"),
 ];
 
+pub const THEME_NAMES: &[&str] = &["none", "midnight", "ocean", "sunset", "forest", "ember", "neon", "matrix", "mono"];
 pub const POSITIONS: &[&str] =
     &["top-left", "top", "top-right", "center-left", "center", "center-right", "bottom-left", "bottom", "bottom-right"];
 pub const LANGUAGES: &[&str] = &["en", "it", "de", "es", "fr", "pt"];
@@ -204,6 +208,11 @@ pub const LAYOUT_NAMES: &[(&str, &str, &str)] = &[
     ("frame", "Digital picture frame (the folder is set in the Digital frame section)", "Cornice digitale (la cartella si sceglie nella sezione Cornice digitale)"),
     ("weather", "Weather, big", "Meteo, grande"),
     ("news", "News headlines, scrolling", "Notizie scorrevoli"),
+    ("halo", "Halo: two big rings (CPU, GPU), the clock in the middle, memory below", "Halo: due grandi anelli (CPU, GPU), orologio al centro, memoria sotto"),
+    ("gauges", "Gauges: four dials, load and temperature of CPU and GPU", "Quadranti: quattro indicatori, carico e temperatura di CPU e GPU"),
+    ("terminal", "Terminal: green-on-black readout, one line per device", "Terminale: lettura verde su nero, una riga per dispositivo"),
+    ("horizon", "Horizon: a huge clock and three thin lines of load", "Orizzonte: un orologio enorme e tre sottili linee di carico"),
+    ("ribbon", "Ribbon: clock, song and weather above a ribbon of readings", "Nastro: orologio, brano e meteo sopra un nastro di valori"),
 ];
 
 /// The tiles of `tiles = ...`: (name, English, Italian).
@@ -358,6 +367,12 @@ pub fn fields() -> Vec<Field> {
             "JPEG screens of the 0416:5302 family (Trofeo Vision 6.86): the size in the frame header is that of the picture sent (raster) or the panel's own (panel). Changed only if --lcd-test shows a partial picture",
             "Schermi JPEG della famiglia 0416:5302 (Trofeo Vision 6.86): la dimensione nell'intestazione è quella dell'immagine inviata (raster) o quella del pannello (panel). Da cambiare solo se --lcd-test mostra un'immagine parziale",
         ));
+    add(Field::new("hid_resend_ms", "screen", "Repeat the picture every (ms, 0 = off)", "Ripeti l'immagine ogni (ms, 0 = spento)", int(0, 1000))
+        .def("0")
+        .help(
+            "Screens of the 0416:5302 family: if the whole screen blinks, dims or goes blank between pictures, keep sending the last picture every this many milliseconds, also while the next one is being drawn (try 1). 0 = off",
+            "Schermi della famiglia 0416:5302: se tutto lo schermo lampeggia, si abbassa di luminosità o si spegne tra un'immagine e l'altra, continua a inviare l'ultima immagine ogni tot millisecondi, anche mentre disegna la prossima (prova 1). 0 = spento",
+        ));
     add(Field::new("hid_rgb565", "screen", "Pixel order of the small screens", "Ordine dei pixel degli schermi piccoli", Choice(&["auto", "little", "big"]))
         .def("auto")
         .help(
@@ -365,6 +380,56 @@ pub fn fields() -> Vec<Field> {
             "Solo gli schermi piccoli 320x240 della famiglia 0416:5302 (immagini RGB565; non verificati su hardware): l'ordine dei byte dei pixel. Usa il test dello schermo per trovarlo",
         ));
     add(Field::new("brightness", "screen", "Brightness", "Luminosità", int(0, 100)).def("100"));
+    add(Field::new("night_mode", "screen", "Dim the screen at night", "Abbassa la luminosità di notte", Bool)
+        .def("false")
+        .group("night")
+        .help("Between the two times below the picture is dimmed to the night brightness", "Tra i due orari qui sotto l'immagine viene abbassata alla luminosità notturna"));
+    add(Field::new("night_start", "screen", "Night starts at (HH:MM)", "La notte inizia alle (HH:MM)", Text)
+        .def("23:00")
+        .group("night")
+        .when("night_mode", &["true"]));
+    add(Field::new("night_end", "screen", "Night ends at (HH:MM)", "La notte finisce alle (HH:MM)", Text)
+        .def("07:00")
+        .group("night")
+        .when("night_mode", &["true"])
+        .help("The night may cross midnight (23:00 to 07:00)", "La notte può passare la mezzanotte (dalle 23:00 alle 07:00)"));
+    add(Field::new("night_brightness", "screen", "Night brightness", "Luminosità notturna", int(0, 100))
+        .def("20")
+        .group("night")
+        .when("night_mode", &["true"])
+        .help("Never brighter than the normal brightness", "Mai più alta della luminosità normale"));
+    for (k, en, it, max, hen, hit) in [
+        ("alert_cpu_temp", "Alert: CPU temperature above (°C)", "Avviso: temperatura CPU sopra (°C)", 150, "0 = off", "0 = spento"),
+        ("alert_gpu_temp", "Alert: GPU temperature above (°C)", "Avviso: temperatura GPU sopra (°C)", 150, "0 = off", "0 = spento"),
+        ("alert_cpu_load", "Alert: CPU load above (%)", "Avviso: carico CPU sopra (%)", 100, "0 = off", "0 = spento"),
+        ("alert_gpu_load", "Alert: GPU load above (%)", "Avviso: carico GPU sopra (%)", 100, "0 = off. Games use the GPU fully, so this suits other uses", "0 = spento. I giochi usano la GPU al massimo, quindi serve per altri usi"),
+        ("alert_ram", "Alert: memory used above (%)", "Avviso: memoria usata sopra (%)", 100, "0 = off", "0 = spento"),
+    ] {
+        add(Field::new(k, "screen", en, it, int(0, max)).def("0").group("alert").help(hen, hit));
+    }
+    add(Field::new("alert_delay", "screen", "Alert: seconds above the limit before it shows", "Avviso: secondi sopra il limite prima di mostrarlo", int(0, 600))
+        .def("3")
+        .group("alert")
+        .help("A short spike does not trigger it", "Un picco breve non lo fa scattare"));
+    add(Field::new("alert_color", "screen", "Alert color", "Colore dell'avviso", Color)
+        .group("alert")
+        .help("Default red", "Predefinito rosso"));
+    add(Field::new("profile", "profiles", "Profile in use", "Profilo in uso", Text)
+        .help(
+            "The name of a profile (see below). What the profile says wins over this file. The tray menu, the hotkey and the rules below can change it without touching the file",
+            "Il nome di un profilo (vedi sotto). Quello che dice il profilo prevale su questo file. Il menu della tray, il tasto rapido e le regole qui sotto lo cambiano senza toccare il file",
+        ));
+    add(Field::new("profile_key", "profiles", "Hotkey to go round the profiles", "Tasto rapido per scorrere i profili", Text)
+        .restart()
+        .help(
+            "For example ctrl+alt+p or shift+f9. Empty = none. Needs a restart of trofeo_lcd (Windows)",
+            "Per esempio ctrl+alt+p oppure shift+f9. Vuoto = nessuno. Serve riavviare trofeo_lcd (Windows)",
+        ));
+    add(Field::new("profile_rules", "profiles", "Switch by program", "Cambia in base al programma", Text)
+        .help(
+            "program=profile, comma separated: mygame.exe=gaming, code.exe=work. While that program is in the foreground the profile is used; it goes back 5 seconds after leaving it (Windows)",
+            "programma=profilo, separati da virgola: mygame.exe=gaming, code.exe=work. Finché quel programma è in primo piano si usa il profilo; si torna indietro 5 secondi dopo averlo lasciato (Windows)",
+        ));
     add(Field::new("language", "screen", "Language of the display", "Lingua del display", Choice(LANGUAGES)).def("en"));
     for (k, en, it) in [
         ("margin", "All sides", "Tutti i lati"),
@@ -796,10 +861,28 @@ pub fn fields() -> Vec<Field> {
         .def("auto")
         .when("font", &["smooth"])
         .help("auto = bolder for small text, lighter for big text", "auto = più marcato per il testo piccolo, più leggero per quello grande"));
+    add(Field::new("theme", "look", "Theme", "Tema", Choice(THEME_NAMES))
+        .def("none")
+        .help(
+            "A whole look in one line (background, colors, panel opacity). It only gives defaults: whatever you set yourself wins over the theme",
+            "Un aspetto completo in una riga (sfondo, colori, opacità dei pannelli). Dà solo valori predefiniti: quello che imposti tu ha la precedenza sul tema",
+        ));
     add(Field::new("text_color", "look", "Info text", "Testo informativo", Color));
     add(Field::new("clock_color", "look", "Big clock", "Orologio grande", Color));
     add(Field::new("text_backdrop", "look", "Panel behind the text", "Pannello dietro il testo", Bool).def("false"));
     add(Field::new("clock_backdrop", "look", "Panel behind the clock", "Pannello dietro l'orologio", Bool));
+    add(Field::new("clock_format", "look", "Time format", "Formato dell'ora", Choice(&["24h", "12h"]))
+        .def("24h")
+        .help("12h = 2:05 PM instead of 14:05, on every clock of the program", "12h = 2:05 PM invece di 14:05, su tutti gli orologi del programma"));
+    add(Field::new("clock_ampm", "look", "Show AM / PM", "Mostra AM / PM", Bool)
+        .def("true")
+        .when("clock_format", &["12h"]));
+    add(Field::new("screen_fade_ms", "look", "Fade between screens (ms, 0 = off)", "Dissolvenza tra le schermate (ms, 0 = spenta)", int(0, 5000))
+        .def("0")
+        .help("when the screen changes (layout rotation, music, gaming) the old picture melts into the new one; 0 = a plain cut, which costs nothing", "quando la schermata cambia (rotazione dei layout, musica, gaming) la vecchia immagine sfuma nella nuova; 0 = stacco netto, che non costa nulla"));
+    add(Field::new("screen_fade_style", "look", "Fade style", "Stile della dissolvenza", Choice(&["cross", "black"]))
+        .def("cross")
+        .help("cross = the pictures dissolve into each other; black = fade out to black, then fade in", "cross = le immagini si dissolvono l'una nell'altra; black = sfuma al nero e poi riappare"));
     add(Field::new("clock_time_size", "look", "Clock size", "Dimensione dell'orologio", int(1, 60)).def("20"));
     add(Field::new("clock_date_size", "look", "Date size", "Dimensione della data", int(1, 30)).def("6"));
     add(Field::new("net_unit", "look", "Network unit", "Unità della rete", Choice(&["kb", "mb", "auto"])).def("kb"));
@@ -915,6 +998,13 @@ pub fn fields() -> Vec<Field> {
             "Only for the FPS the Radeon driver reports (games where Windows gives no frame events, such as exclusive-fullscreen DX9 games). Some of them read double: set 2 to halve it. 1 = as the driver says",
             "Solo per gli FPS riportati dal driver Radeon (giochi per cui Windows non da eventi di frame, come i giochi DX9 a schermo intero esclusivo). Alcuni leggono il doppio: imposta 2 per dimezzare. 1 = come dice il driver",
         ));
+    add(Field::new("start_in_tray", "system", "Start minimised in the tray", "Avvia ridotto nella tray", Bool)
+        .def("false")
+        .restart()
+        .help(
+            "Windows. When the program starts, the console window goes away and an icon appears in the tray: a click shows or hides the window, the right button opens a menu (show / hide, exit)",
+            "Windows. All'avvio la finestra della console scompare e compare un'icona nella tray: un clic mostra o nasconde la finestra, il tasto destro apre un menu (mostra / nascondi, esci)",
+        ));
     add(Field::new("update_check", "system", "Tell me when a new version is out", "Avvisami quando esce una nuova versione", Bool)
         .def("false")
         .restart()
@@ -960,6 +1050,72 @@ pub fn fields() -> Vec<Field> {
 }
 
 /// The sub-heading of a group in both languages.
+/// The sections gathered by theme, as the side list of the editor shows them:
+/// (English, Italian, ids of the sections).
+pub const CATEGORIES: &[(&str, &str, &[&str])] = &[
+    ("Screen and sensors", "Schermo e sensori", &["screen", "lhm"]),
+    ("Look", "Aspetto", &["background", "effect", "look", "show", "items", "spectrum"]),
+    ("Screens", "Schermate", &["layouts", "tiles", "dash", "frame", "steam", "profiles", "builder"]),
+    ("Music and games", "Musica e giochi", &["music", "gaming", "game"]),
+    ("Online", "Online", &["online"]),
+    ("System", "Sistema", &["system"]),
+    ("Share", "Condividi", &["share"]),
+];
+
+/// The index in [`CATEGORIES`] of the one that holds a section.
+pub fn category_of(section: &str) -> Option<usize> {
+    CATEGORIES.iter().position(|(_, _, ids)| ids.contains(&section))
+}
+
+/// The settings that match a search: every word of `query` must be in the label (English or
+/// Italian), the key or the hint. Matches in the label or the key come first.
+pub fn search<'a>(fields: &'a [Field], query: &str) -> Vec<&'a Field> {
+    let words: Vec<String> = query.split_whitespace().map(|w| w.to_lowercase()).collect();
+    if words.is_empty() {
+        return Vec::new();
+    }
+    let mut hits: Vec<(u8, &Field)> = Vec::new();
+    for f in fields {
+        let head = format!("{} {} {}", f.en, f.it, f.key).to_lowercase();
+        let all = format!("{head} {} {}", f.help_en, f.help_it).to_lowercase();
+        if !words.iter().all(|w| all.contains(w.as_str())) {
+            continue;
+        }
+        let rank = if words.iter().all(|w| f.key.to_lowercase().contains(w.as_str())) {
+            0
+        } else if words.iter().all(|w| head.contains(w.as_str())) {
+            1
+        } else {
+            2
+        };
+        hits.push((rank, f));
+    }
+    hits.sort_by_key(|(r, _)| *r);
+    hits.into_iter().map(|(_, f)| f).collect()
+}
+
+/// Is `v` a value the setting accepts? Only the kinds with a clear rule are checked (a switch,
+/// a choice, a number in its range, colors); the others are taken as they are.
+pub fn check_value(f: &Field, v: &str) -> bool {
+    let v = v.trim();
+    if f.key == "theme" {
+        // a built-in theme, `none`, or the name of a theme of your own (the file is checked later)
+        return v == "none" || crate::themes::find(v).is_some() || crate::themes::valid_name(&v.to_ascii_lowercase()).is_ok();
+    }
+    match &f.kind {
+        Kind::Bool => v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("false"),
+        Kind::Choice(opts) => opts.iter().any(|o| o.eq_ignore_ascii_case(v)),
+        Kind::Int { min, max } => v.parse::<i64>().is_ok_and(|n| (*min..=*max).contains(&n)),
+        Kind::Float { min, max } => v.parse::<f32>().is_ok_and(|n| n >= *min && n <= *max),
+        Kind::Color => parse_color(v).is_some(),
+        Kind::ColorList => {
+            let items = split_list(v);
+            !items.is_empty() && items.iter().all(|c| parse_color(c).is_some())
+        }
+        _ => !v.is_empty(),
+    }
+}
+
 pub fn group_title(group: &str) -> (&str, &str) {
     match group {
         "margins" => ("Margins (pixels)", "Margini (pixel)"),
@@ -970,6 +1126,8 @@ pub fn group_title(group: &str) -> (&str, &str) {
         "palette" => ("Colors from the presets", "Colori dai preset"),
         "look" => ("Look", "Aspetto"),
         "update" => ("New version notice", "Avviso di nuova versione"),
+        "night" => ("Night mode", "Modalità notte"),
+        "alert" => ("Alerts", "Avvisi"),
         "gaming" => ("Gaming screen", "Schermata gaming"),
         "switch" => ("When to switch", "Quando passare"),
         "design" => ("Design and readings", "Grafica e letture"),
@@ -987,6 +1145,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_tray_option_is_off_by_default_and_needs_a_restart() {
+        let f = fields();
+        let t = f.iter().find(|x| x.key == "start_in_tray").expect("start_in_tray is in the schema");
+        assert!(t.default == "false" && t.restart);
+    }
+
+    #[test]
     fn keys_are_unique_and_sections_exist() {
         let f = fields();
         let mut keys: Vec<&str> = f.iter().map(|x| x.key.as_str()).collect();
@@ -999,7 +1164,8 @@ mod tests {
             assert!(!x.en.is_empty() && !x.it.is_empty(), "{}: a label is missing", x.key);
         }
         for (id, _, _) in SECTIONS {
-            assert!(f.iter().any(|x| x.section == *id), "section {id} is empty");
+            // "share" and "builder" are pages of buttons of the editor, not a list of settings
+            assert!(*id == "share" || *id == "builder" || f.iter().any(|x| x.section == *id), "section {id} is empty");
         }
     }
 
@@ -1043,5 +1209,41 @@ mod tests {
         for (n, c) in COLOR_NAMES {
             assert_eq!(parse_color(n), Some(*c));
         }
+    }
+
+    #[test]
+    fn every_section_is_in_exactly_one_category() {
+        for (id, _, _) in SECTIONS {
+            let n = CATEGORIES.iter().filter(|(_, _, ids)| ids.contains(id)).count();
+            assert_eq!(n, 1, "section {id} is in {n} categories");
+        }
+        for (_, _, ids) in CATEGORIES {
+            for id in *ids {
+                assert!(SECTIONS.iter().any(|(s, _, _)| s == id), "unknown section {id}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_search_finds_settings_by_label_key_and_hint_in_both_languages() {
+        let f = fields();
+        let keys = |q: &str| search(&f, q).iter().map(|x| x.key.clone()).collect::<Vec<_>>();
+        assert!(keys("12h").contains(&"clock_format".to_string()));
+        assert!(keys("formato dell'ora").contains(&"clock_format".to_string()));
+        assert!(keys("Time format").contains(&"clock_format".to_string()));
+        assert!(keys("fade").contains(&"screen_fade_ms".to_string()));
+        assert_eq!(keys("clock_format").first().map(String::as_str), Some("clock_format"), "an exact key comes first");
+        assert!(keys("   ").is_empty());
+        assert!(keys("zzzzqqq").is_empty());
+    }
+
+    #[test]
+    fn values_are_checked_by_their_kind() {
+        let f = fields();
+        let get = |k: &str| f.iter().find(|x| x.key == k).unwrap().clone();
+        assert!(check_value(&get("clock_ampm"), "false") && !check_value(&get("clock_ampm"), "maybe"));
+        assert!(check_value(&get("clock_format"), "12h") && !check_value(&get("clock_format"), "13h"));
+        assert!(check_value(&get("screen_fade_ms"), "600") && !check_value(&get("screen_fade_ms"), "9000"));
+        assert!(check_value(&get("clock_color"), "#FF8800") && !check_value(&get("clock_color"), "nope"));
     }
 }

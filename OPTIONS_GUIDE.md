@@ -21,6 +21,11 @@ the same file for you.
   display. Choose *Nothing playing* / *Music playing (spectrum)* / *Music card* to see the other
   states, *Animate* to see the movement, and the layout selector to see each screen
   of a rotation.
+- **Search.** The box at the top of the list finds a setting by its label (English or Italian), its key (`clock_format`) or its hint: every word you type must match. The results come from all the sections, grouped under the name of their section, and can be changed right there; *go to the section* opens the section they belong to. The X next to the box clears the search.
+- **Settings I changed** (under the search box) lists only the settings that are written in the file, from all sections, each with its `x` to put it back to the default.
+- **Categories.** The sections are gathered by theme: *Screen and sensors*, *Look*, *Screens*, *Music and games*, *Online*, *System* and *Share*. The group that holds the section you are in is open; the others are closed until you click them.
+- **Restart notice.** After saving, if one of the settings you changed needs a restart of `trofeo_lcd`, a notice at the bottom lists them; press OK to dismiss it. The others apply by themselves within a second.
+- **Import a design.** On the *Share your design* page, paste the settings of a design from the gallery and press *Import*: only the look is taken (see [Share your design](#share-your-design)), the values that are not valid and the settings that are not part of the look are listed and left out, and nothing is saved until you press Save.
 - **Sections** on the left cover everything in this guide. An asterisk marks the settings
   that need a restart of `trofeo_lcd`; a number shows how many settings of that section
   you changed. A setting you leave at its default is not written to the file; the small
@@ -88,7 +93,7 @@ default.
 
 Of the options that actually live in `trofeo.conf`, everything reloads live
 *except* `deepcool`, `fps_monitor`, `weather_city`, `ticker_source`,
-`ticker_refresh_min` and the three `update_*` keys — change one of these in the file and the program tells
+`ticker_refresh_min`, `start_in_tray` and the three `update_*` keys — change one of these in the file and the program tells
 you on the next reload that a restart is needed, while the rest of the file
 still applies live.
 
@@ -114,6 +119,7 @@ byte; for a model that is not in the program's table the console says so and `pa
 |---|---|---|---|
 | `hid_mount` | `--hid-mount` | `auto` \| `0` \| `90` \| `180` \| `270` (degrees the picture is turned for the way the panel is mounted) | `auto` |
 | `hid_header` | `--hid-header` | `raster` (the size of the picture sent) \| `panel` (the panel's own size); JPEG screens | `raster` |
+| `hid_resend_ms` | `--hid-resend-ms` | `0`-`1000` (milliseconds; `0` = off): keep sending the last picture every this many ms, from a thread of its own | `0` |
 | `hid_rgb565` | `--hid-rgb565` | `auto` \| `little` \| `big`: byte order of the pixels of the small RGB565 screens (`auto` = by model) | `auto` |
 | — | `--lcd-test` | numbered test pictures, 5 s each; then it asks for the number of the upright one and writes the values into `trofeo.conf` | |
 
@@ -123,6 +129,8 @@ numbered pictures (8 for JPEG screens: every `hid_mount` with each `hid_header`;
 corner, the arrow pointing right); the values are filled in, then press Save. Without the editor run
 `trofeo_lcd --lcd-test` and type the number. The values apply live. `orientation` and `flip` work on top of them,
 as on the other screens. Close the vendor program (TRCC) first: only one program can drive the screen.
+
+**If the whole screen blinks, dims or goes blank.** Some units seem to blank the picture when no data reaches them for a moment (reported on a 6.86 with model byte SUB = 1: at 2–15 fps everything disappears, at 120 fps the picture only dims). `hid_resend_ms` makes a thread of its own keep sending the last picture every this many milliseconds, **also while the next picture is being drawn and encoded**, so the panel never waits for data. The new picture goes out as soon as it is ready, between two repeats. `1` was the best value on the screen it was tried on (higher values made the flicker worse); it costs USB traffic and a little CPU, since the picture is a few tens of KB each time. It applies live. `0` (default) is off.
 
 `auto` mount is `90` for a 6.86 whose model byte SUB is 2 and for the RGB565 screens, `0` otherwise. RGB565 screens need
 a 240×320 raster, so only 90 and 270 give a picture. Not supported: screens that do not answer the handshake (some
@@ -782,6 +790,125 @@ status_position = bottom-left
 Software dimming — the LY protocol has no brightness command, so the image is
 darkened before being sent.
 
+### Night mode
+
+| Key | CLI | Values | Default |
+|---|---|---|---|
+| `night_mode` | `--night-mode` | `true` / `false` | `false` |
+| `night_start` | `--night-start` | `HH:MM` | `23:00` |
+| `night_end` | `--night-end` | `HH:MM` | `07:00` |
+| `night_brightness` | `--night-brightness` | `0`-`100` | `20` |
+
+Between `night_start` and `night_end` the picture is dimmed to `night_brightness` instead of
+`brightness` (never brighter than `brightness`). The night may cross midnight (`23:00` to `07:00`),
+or be inside a day (`09:00` to `17:00`); equal times mean "never". The time is the PC's local time.
+Off by default, and when it is off nothing is checked. It applies live when the file is saved.
+
+```ini
+night_mode = true
+night_start = 23:00
+night_end = 07:00
+night_brightness = 15
+```
+
+## Alerts
+
+| Key | CLI | Values | Default |
+|---|---|---|---|
+| `alert_cpu_temp` | `--alert-cpu-temp` | `0`-`150` (°C, `0` = off) | `0` |
+| `alert_gpu_temp` | `--alert-gpu-temp` | `0`-`150` (°C, `0` = off) | `0` |
+| `alert_cpu_load` | `--alert-cpu-load` | `0`-`100` (%, `0` = off) | `0` |
+| `alert_gpu_load` | `--alert-gpu-load` | `0`-`100` (%, `0` = off) | `0` |
+| `alert_ram` | `--alert-ram` | `0`-`100` (% of memory used, `0` = off) | `0` |
+| `alert_delay` | `--alert-delay` | `0`-`600` (seconds) | `3` |
+| `alert_color` | `--alert-color` | a color | red |
+
+When a reading stays **above its limit for `alert_delay` seconds**, the whole screen gets a pulsing
+border and a bar at the top with the reading (`CPU TEMP 91C`), drawn on top of every screen. A short
+spike never triggers it. The alert clears when the reading falls 2 degrees (or percent) below the
+limit, so it does not flicker around the limit. A reading that is not available on your PC (for example
+a temperature the sensor cannot read) never raises an alert. If several limits are exceeded, the first
+one in the table above is shown.
+
+Every limit is `0` (off) by default, and with all limits off nothing is read or drawn. Games use the
+GPU fully, so `alert_gpu_load` is better left off unless you use the PC for something else. It applies
+live when the file is saved.
+
+```ini
+alert_cpu_temp = 90
+alert_ram = 95
+alert_delay = 5
+alert_color = 255,160,0
+```
+
+## Profiles
+
+| Key | CLI | Values | Default |
+|---|---|---|---|
+| `profile` | `--profile` | the name of a profile | none |
+| `profile_key` | `--profile-key` | a hotkey such as `ctrl+alt+p` or `shift+f9` *(restart, Windows)* | none |
+| `profile_rules` | `--profile-rules` | `program=profile, program=profile` *(Windows)* | none |
+
+A profile is a few settings that are laid over your configuration file **while it is in use**, and that you can switch at any moment without touching the file: another layout and brightness for gaming, a quiet theme for work, a dim one for the evening. It is a text file `profiles/<name>.profile` in a `profiles` folder next to the configuration file, with `key = value` lines:
+
+```ini
+# profiles/gaming.profile
+layout = gaming
+brightness = 100
+theme = neon
+```
+
+- **What the profile says wins** over the configuration file (and over the theme's defaults); the command line still wins over everything. What it does not say stays as in the file.
+- Only settings that **apply live** can be in a profile (not the ones marked "needs a restart" in the editor): switching never needs a restart. A file with anything else is refused, with the key named.
+- Names: lowercase letters, digits, `-` and `_` (up to 40); `none` means no profile.
+
+**Which profile is in use**, in this order: (1) the one a **rule** gives to the program in the foreground, (2) the one chosen **by hand**, (3) `profile = name` in the configuration file, (4) none.
+
+- **By hand**: the tray menu (*Profile*, Windows), the settings editor (*Screens → Profiles → Use*) or the hotkey. The choice is saved in `profiles/active`, not in your configuration file, and `trofeo_lcd` follows within a second. *No profile* is also a choice; *Let the file decide* in the editor forgets the choice.
+- **Hotkey** `profile_key = ctrl+alt+p`: every press goes to the next profile (none → first → … → last → none). Modifiers `ctrl`, `alt`, `shift`, `win`; keys `f1`-`f12`, `a`-`z`, `0`-`9`, `printscreen`; a letter or digit needs a modifier. A restart is needed to change it. Windows only.
+- **Rules** `profile_rules = mygame.exe=gaming, code.exe=work`: while that program (the name of its `.exe`, case does not matter) is the one in the foreground, its profile is used. The profile goes back **5 seconds after** leaving the program, so a quick Alt-Tab does not make the screen flip. Windows (on Linux under X11 the program name is found too). Checked every 2 seconds, and only when there are rules.
+
+In the settings editor, *Screens → Profiles* lists the profiles, makes a new one (*Fill with the settings I changed* starts from what your file says; remove the lines you do not want) and edits the existing ones. Nothing runs while there are no profiles and none of the three keys is set.
+
+## Themes
+
+| Key | CLI | Values | Default |
+|---|---|---|---|
+| `theme` | `--theme` | `none`, `midnight`, `ocean`, `sunset`, `forest`, `ember`, `neon`, `matrix`, `mono` | `none` |
+
+A theme gives a whole look in one line: an animated background, the text, clock and spectrum colors,
+the dashboard colors and the panel opacity. A theme only supplies **defaults**: every setting you write
+in the file (or on the command line) wins over it, so a theme is a starting point to adjust — for
+example `theme = ocean` and `clock_color = #FFD000` keeps everything from *ocean* except the clock.
+A theme never touches files, folders or online settings. `none` (the default) changes nothing.
+It applies live when the file is saved.
+
+```ini
+theme = ocean
+clock_color = #FFD000
+```
+
+### Your own themes — save, export, share, import
+
+In the settings editor, **Share your design** has a block **Your themes**: type a name and press **Save my look as a theme**. The look you have made (a built-in theme and your changes on top of it included) is written to `themes/<name>.theme`, in a `themes` folder next to your configuration file. Then `theme = <name>` brings it back (the *Theme* setting lists your themes after the built-in ones).
+
+A theme file is plain text, `key = value` lines of the look, so you can also write or edit one by hand:
+
+```ini
+# themes/gold.theme
+background_effect = plasma
+effect_palette = sunset
+clock_color = #FFD000
+panel_opacity = 30
+```
+
+- Only the **look** can be in a theme: no files, folders, weather city, sensors or system settings (a file that has them is refused, with the key named). `theme` itself cannot be in a theme.
+- A name is lowercase letters, digits, `-` and `_` (up to 40) and cannot be the name of a built-in theme.
+- As with the built-in themes, what is written in the configuration file wins over the theme.
+- **To give a theme to someone:** press **Copy the text** next to it (a message, a forum post), or send the file. The other person pastes the text in **Import a design**, types a name and presses **Import as a theme**, or presses **Import a theme file...** and picks the file; it is saved in their `themes` folder.
+- **To post it in the gallery:** after taking the picture, **Save my look as a theme file to attach** writes `<name>.theme.txt` next to the picture (GitHub does not accept `.theme` files, hence the `.txt`); drag it into the *Theme file* box of the gallery page. Whoever downloads it imports it with **Import a theme file...** (the name is taken from the file name).
+- In the settings text of a gallery post, a theme of your own is written out as its settings (others do not have your file); a built-in theme stays `theme = name`.
+
 ## DeepCool integration *(restart required)*
 
 | Key | CLI | Values | Default | In `trofeo.conf`? |
@@ -1046,15 +1173,34 @@ mem_unit = gb
 percent_decimals = 1
 ```
 
+## Fade between screens
+
+| Key | CLI | Values | Default |
+|---|---|---|---|
+| `screen_fade_ms` | `--screen-fade-ms` | `0`-`5000` (milliseconds, `0` = off) | `0` |
+| `screen_fade_style` | `--screen-fade-style` | `cross` / `black` | `cross` |
+
+Whenever the screen on the display changes — the layout rotation moves to the next layout, the music screen starts or ends, the gaming screen starts or ends, the spectrum replaces the clock — the old picture melts into the new one instead of cutting. `screen_fade_ms` is the length of the fade: `300`–`800` feels natural. `0` (the default) switches the feature off completely: nothing is copied or blended, so it costs nothing. `screen_fade_style = cross` dissolves one picture into the other; `black` fades the old one out to black and then fades the new one in. The program draws at its active frame rate during a fade so it looks smooth, then goes back to the idle rate. The update banner is not part of the fade. Applies live when the file is saved.
+
+```ini
+screen_fade_ms = 600
+screen_fade_style = cross
+```
+
 ## Big clock
 
 | Key | CLI | Values | Default |
 |---|---|---|---|
+| `clock_format` | `--clock-format` | `24h` / `12h` | `24h` |
+| `clock_ampm` | `--clock-ampm` | `true`/`false` (only with `12h`) | `true` |
 | `clock_time_size` | `--clock-time-size` | `1`-`60` | `20` |
 | `clock_date_size` | `--clock-date-size` | `1`-`30` | `6` |
 | `clock_backdrop` | `--clock-backdrop` | `true`/`false` | follows `text_backdrop` |
 
+`clock_format = 12h` writes the time as `2:05:09 PM` on **every** clock of the program: the big clock, the status line, the clock layouts, the tiles, `deck` / `cards` / `orbit` / `console`, the gaming, Steam and music screens, and the `time` item of the music footer. `clock_ampm = false` drops the AM / PM (`2:05:09`). The date is not affected.
+
 ```ini
+clock_format = 12h
 clock_time_size = 28
 clock_date_size = 8
 clock_backdrop = true
@@ -1079,6 +1225,59 @@ text_backdrop = true
 background = C:\Pictures\bg.jpg
 ```
 
+## Free layouts — design your own screen
+
+A free layout is a screen you design yourself, from elements placed anywhere: texts with live values, bars, rings, rectangles and pictures. Use it by its name in the list of screens, like any other:
+
+```ini
+layout = default, my-screen:20
+```
+
+It is a text file `layouts/<name>.layout` in a `layouts` folder next to the configuration file. The **settings editor has a visual builder** for it (*Screens → Layout builder*), that reads and writes the same file; or write it by hand. One element per line, `kind key=value ...`, texts in quotes, `#` starts a comment line:
+
+```ini
+# layouts/my-screen.layout
+rect  x=0 y=0 w=100 h=100 color=#101820
+text  x=50 y=14 anchor=c size=16 color=#00C8FF text="{time}"
+text  x=4  y=52 size=4 text="CPU {cpu}  {cpu_temp}"
+bar   x=4  y=68 w=44 h=8 value=cpu_temp hot=80
+ring  x=80 y=62 w=30 h=70 anchor=c value=gpu text="{gpu}"
+```
+
+- **Positions and sizes are percentages of the screen** (`x`, `y`, `w`, `h`), so the same file fits a landscape and a portrait panel. `x`, `y` is where the `anchor` point of the element goes: `tl` (top left, the default), `t`, `tr`, `l`, `c` (centre), `r`, `bl`, `b`, `br`.
+- **Elements are drawn in the order of the file** (the last one is on top), over the background of the configuration.
+- `text`: `text="..."`, `size` (the scale of the font, 1-80), `color`; `w` is an optional limit of the width (a longer text is made smaller). Inside the text `{name}` is replaced with a live value: `{cpu}` `{gpu}` `{ram}` `{cpu_temp}` `{gpu_temp}` `{gpu_hotspot}` `{cpu_power}` `{gpu_power}` `{cpu_mhz}` `{cpu_freq}` `{fps}` `{ram_used}` `{ram_total}` `{net_down}` `{net_up}` `{disk_read}` `{disk_write}` `{song}` `{time}` `{time_short}` `{date}` `{weather_temp}` `{weather_city}`. A value that is not available on your PC shows `--`.
+- `bar`: `w`, `h`, `value=` one of `cpu gpu ram cpu_temp gpu_temp gpu_hotspot cpu_power gpu_power cpu_mhz fps`, `min` (0) and `max` (the usual maximum of the value), `color` (default: by level), `back` (the track), `hot=` and `hot_color=` (from that value up the bar takes that color).
+- `ring`: like `bar` (`w`, `h` give the size, the ring is a circle in it), plus `thick` (% of the radius) and `text` (shown in the middle, sized to fit).
+- `rect`: `w`, `h`, `color`, `opacity` (0-100).
+- `image`: `file="C:\Pictures\logo.png"` (a path, or relative to the folder of the configuration file), `w`, `h` (the picture is fitted in), `opacity`. PNG, JPEG, GIF (first frame), BMP, WebP.
+- A mistake is written on the screen with its line number (and in the console), and the rest of your settings keep working. The file is looked at again once a second, so what you save appears at once without a restart.
+
+**The builder**: drag a box to move it, drag the corner to resize it (everything but a text; a text is sized with its *Text size*), click an element (or its entry in the list) to edit it on the right. Arrows nudge by half a percent, Delete removes, Ctrl+D copies, Ctrl+Z / Ctrl+Y undo and redo, and Alt while dragging turns the snapping off (positions snap to half a percent and to the edges and middle). *Lock* stops the mouse from moving an element (for a background rectangle). Every change is saved at once; *Add it to the screens* puts the layout in your `layout` list, and then the screen follows your work as you make it. To share a layout, give the `.layout` file to someone; they put it in their `layouts` folder.
+
+The free layout is a screen like *tiles* or *frame*: it is shown when idle, and the gaming and music screens still take over when they start.
+
+### Built-in designs
+
+Five free layouts come with the program, so `layout = halo` works with no file:
+
+| Name | What it shows |
+|---|---|
+| `halo` | two big rings (CPU, GPU), the clock in the middle, memory below |
+| `gauges` | four dials: load and temperature of CPU and GPU |
+| `terminal` | green-on-black readout, one line per device (CPU, GPU, RAM, network, disk) |
+| `horizon` | a huge clock and three thin lines of load (CPU, GPU, RAM) |
+| `ribbon` | clock, song and weather above a ribbon of readings |
+
+![halo](img/layout-halo.png)
+![gauges](img/layout-gauges.png)
+![terminal](img/layout-terminal.png)
+![horizon](img/layout-horizon.png)
+![ribbon](img/layout-ribbon.png)
+
+On a portrait panel the program uses the version drawn for it. To change one, open the layout builder and pick **Copy a built-in design** (the copy is named as you typed in the name box, or `<design>-mine`); or save a file `layouts/halo.layout` yourself: a file with the same name takes the place of the built-in one. The five are in the screens list of the settings editor, among the other layouts.
+
+
 ## Preset layouts
 
 | Key | CLI | Values | Default |
@@ -1096,7 +1295,7 @@ gaming, cpu, gpu, tiles, deck, cards, orbit, console, steam, frame, weather, new
 - `default2` = the standard screen with [per-item](#per-item-control) styling.
 - `news` = the [ticker](#ticker)'s headlines, big and scrolling, full screen.
 - `tiles` = the [glass tiles](#tiles-layout) dashboard.
-- `steam` = the [Steam cover flow](#steam-cover-flow): your installed Steam games as covers in perspective.
+- `steam` = the [Steam cover flow](#steam-cover-flow-applies-live): your installed Steam games as covers in perspective.
 - `frame` = the [digital picture frame](#digital-frame): a collage of the pictures of a folder.
 - Everything else replaces the clock with big panel(s); the top status block
   and spectrum turn off (use `show = nowplaying, time` etc. to add lines back
@@ -1186,8 +1385,8 @@ tiles_palette_stagger = 70
 *Which reading needs what?* AMD Ryzen CPU temperature and power are read by the program itself (Windows: PawnIO
 and Administrator; Linux: `k10temp` and RAPL). **Intel CPUs have no built-in reader**: on Windows their
 temperature and power come from LibreHardwareMonitor, on Linux they stay empty. NVIDIA and Radeon cards are read
-through their drivers. The full table and the set-up steps are in the README,
-[Which sensors you need and what to install](README.md#which-sensors-you-need-and-what-to-install).
+through their drivers. The full table and the set-up steps are in the docs,
+[Which sensors you need and what to install](docs/SENSORS.md).
 
 Fan speeds come from [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor)'s
 web server: start it **as administrator**, then *Options → Remote Web Server → Run* (port 8085) and
@@ -1462,6 +1661,37 @@ nothing else prints anywhere visible.
 trofeo_lcd.exe --hide-console
 ```
 
+## Share your design
+
+The settings editor has a page of its own, **Share your design** (last in the list), to show your screen in the project's gallery on GitHub. It has no setting in `trofeo.conf`.
+
+1. Press **Take a picture of my screen**. The editor asks the running `trofeo_lcd` (it must be running with the same configuration file, version 2.17 or newer) to save the picture it is showing; within a second the picture appears in the editor. The files go to a `gallery` folder next to `trofeo.conf`. **Use the preview instead** makes the picture from the editor's preview, which uses made-up values.
+2. **Look at the picture.** It is public once posted: the title of the song playing, the name of a game, the city of the weather or other names may be on it.
+3. **Copy the settings** copies the settings of the look that you set (screens, colors, fonts, tiles, music design...). Files, folders, the weather city, the sensors and the system settings are never included.
+4. **Open the GitHub page**: the gallery form of the project. Drag the picture file into the box for it, paste the settings, and send. You need a GitHub account; the program does not send anything by itself and keeps no token.
+
+**Import a design** goes the other way: paste the settings of a gallery post and press *Import*; the settings of the look are applied to your file (not saved until you press Save), the others are listed and left out.
+
+The gallery is the list of issues with the label `gallery`: <https://github.com/haven80/trofeo-lcd-rs/issues?q=is%3Aissue+label%3Agallery>. Behind the button, the editor writes a small file `trofeo_share.request` next to the configuration file and the program, which looks for it twice a second, saves the picture and removes it.
+
+## Start minimised in the tray *(restart required, Windows)*
+
+| Key | CLI | Values | Default |
+|---|---|---|---|
+| `start_in_tray` | `--start-in-tray` | `true`/`false` | `false` |
+
+With `start_in_tray = true` (settings editor: *System*, "Start minimised in the tray"), once the program is
+running — the screen is found and working — its console window goes away and an **icon appears in the notification
+area** of the taskbar. A click on the icon shows or hides the window again. The right button opens a menu:
+**Open settings editor** (starts `trofeo_config.exe`, which must be in the same folder, on the configuration file in use),
+**Show / Hide window**, **Exit**. Exit shows the window again and quits the program.
+
+- Nothing changes unless you turn it on. It needs a restart.
+- If the program is started from Windows Terminal, the window that is hidden is the whole Terminal window (with all its tabs).
+  The autostart task (`scripts/install-autostart.ps1 -Arguments "--start-in-tray"`) runs in its own console, which is the clean way.
+- With `--hide-console` too there is no window to show: the icon still gives the editor and Exit.
+- On other systems the option is ignored, with a warning.
+
 ## Other flags (not settings, but useful)
 
 | Flag | What it does |
@@ -1604,5 +1834,5 @@ trofeo_lcd.exe --screenshot-key f9 --openrgb-device Aorus --hide-console
 
 See also [`trofeo.conf.example`](./trofeo.conf.example) for the same options
 as inline comments you can uncomment directly, and the main
-[`README.md`](./README.md) for setup, second-monitor mode, and build
-instructions.
+[`README.md`](./README.md) for setup, and the [`docs/`](./docs/README.md) folder for
+the second-monitor mode, the sensors, autostart and build instructions.

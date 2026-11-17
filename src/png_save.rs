@@ -108,6 +108,11 @@ pub fn save(fb: &Framebuffer, prefix: &str) -> io::Result<PathBuf> {
     Ok(path)
 }
 
+/// Save the picture at exactly `path` (used by "Share your design").
+pub fn save_to(fb: &Framebuffer, path: &std::path::Path) -> io::Result<()> {
+    std::fs::write(path, encode(fb))
+}
+
 /// Path to the user's Desktop folder.
 #[cfg(windows)]
 fn desktop_dir() -> io::Result<PathBuf> {
@@ -166,7 +171,7 @@ mod tests {
         assert_eq!(&png[png.len() - 8..png.len() - 4], b"IEND");
     }
 
-    /// Write a sample PNG to target/ to validate against an external
+    /// Write a sample PNG beside the test executable to validate against an external
     /// decoder (manual test via System.Drawing PowerShell).
     #[test]
     fn write_sample_png_for_external_validation() {
@@ -176,7 +181,7 @@ mod tests {
             *byte = (i * 7) as u8; // deterministic pattern
         }
         let out = encode(&fb);
-        std::fs::write(std::path::Path::new("target/png_test_sample.png"), out)
+        std::fs::write(std::env::current_exe().unwrap().parent().unwrap().join("png_test_sample.png"), out)
             .expect("write sample PNG");
     }
 
@@ -194,7 +199,7 @@ mod tests {
         }
         let raw = px.len();
         let png = encode(&fb);
-        std::fs::write(std::path::Path::new("target/png_test_flat.png"), &png)
+        std::fs::write(std::env::current_exe().unwrap().parent().unwrap().join("png_test_flat.png"), &png)
             .expect("write sample PNG");
         assert!(
             png.len() * 10 < raw,

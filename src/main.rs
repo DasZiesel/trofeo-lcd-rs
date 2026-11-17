@@ -33,12 +33,15 @@ mod netdisk;
 mod openrgb_sync;
 mod pawnio;
 mod effect;
+mod fade;
 mod pixel_game;
 mod spectrum;
 mod steam;
 mod frame;
+mod free_draw;
 mod tiles;
 mod ticker;
+mod tray;
 mod update;
 mod weather;
 mod weather_icon;
@@ -56,7 +59,23 @@ use trofeo_lcd::i18n::Lang;
 use trofeo_lcd::layout::{Anchor, BgLayout, Fit, Show};
 use trofeo_lcd::i18n;
 use trofeo_lcd::{Framebuffer, LyLcd, Orientation};
-use trofeo_lcd::{hotkey, png_save, smooth_font};
+use trofeo_lcd::{hotkey, png_save, share, smooth_font};
+
+/// Keep screen transitions only within the same usable sensor generation.
+fn retain_sensor_fade(
+    fade: &mut fade::Fade,
+    previous: &mut [Option<trofeo_lcd::sensor_display::HistoryKey>; 6],
+    current: [Option<trofeo_lcd::sensor_display::HistoryKey>; 6],
+) {
+    if !previous.iter().zip(&current).all(|(a, b)| match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.same_epoch(*b),
+        _ => false,
+    }) {
+        *fade = fade::Fade::new();
+    }
+    *previous = current;
+}
 
 /// Number of EQ bars drawn.
 const NUM_BARS: usize = 48;
@@ -184,6 +203,9 @@ struct Config {
     /// shortcut without showing a window. Does not write logs to any file.
     /// Only applies on Windows — ignored on other OSes (with a warning).
     hide_console: bool,
+    /// `start_in_tray` / `--start-in-tray`: once running, the console goes away and a tray icon
+    /// shows / hides it again (Windows only, see `tray.rs`). Off by default.
+    start_in_tray: bool,
     /// DeepCool Digital integration (sends CPU data to the DeepCool
     /// cooler/case display via HID) — enabled by default, can be disabled with
     /// `--no-deepcool`.
@@ -194,6 +216,12 @@ struct Config {
     /// — (virtual-key code, raw label from the argument). `None` = DISABLED
     /// (default); enabled only if `--screenshot-key` is given.
     screenshot_key: Option<(u32, String)>,
+    /// Hotkey that goes round the profiles: (modifiers, virtual-key code, label). `None` = off.
+    profile_key: Option<(u32, u32, String)>,
+    /// `profile_rules`: program -> profile (empty = none).
+    profile_rules: Vec<(String, String)>,
+    /// The profile that was laid over the configuration file (None = none).
+    active_profile: Option<String>,
     /// `landscape` (default) or `portrait` (screen mounted upright) —
     /// from `--orientation` or `orientation = ...` in trofeo.conf.
     orientation: Orientation,
@@ -207,6 +235,9 @@ struct Config {
     hid_mount: Option<trofeo_lcd::Rotation>,
     /// HID screens: write the panel's own size in the frame header (`hid_header = panel`).
     hid_header_panel: bool,
+    /// HID screens: send the last frame again every this many ms while no new one is ready
+    /// (`hid_resend_ms`, 0 = off).
+    hid_resend_ms: u32,
     /// HID screens with RGB565 pictures: `Some(true)` = big-endian pixels, `None` = by model.
     hid_big_endian: Option<bool>,
     /// Margins (px) to keep the interface away from the screen edges.
@@ -223,6 +254,8 @@ struct Config {
     ffmpeg: Option<String>,
     /// Brightness 0-100.
     brightness: u8,
+    /// Night mode: a lower brightness between `night_start` and `night_end`.
+    night: Night,
     /// FPS via ETW (admin), for any GPU.
     fps_monitor: bool,
     /// Explicit config file (`--config`), for hot reloading.
@@ -330,6 +363,7 @@ fn print_help() {
          \x20\x20                          pictures, asks which is upright, writes hid_mount/hid_header\n\
          \x20\x20--hid-mount <D>          0416:5302: auto | 0 | 90 | 180 | 270 (degrees); --hid-header\n\
          \x20\x20                          raster|panel; --hid-rgb565 auto|little|big (small screens)\n\
+         \x20\x20--hid-resend-ms <N>      0416:5302: send the last picture again every N ms (0 = off)\n\
          \x20\x20--orientation <O>       'landscape' (default) or 'portrait' (screen mounted upright)\n\
          \x20\x20--panel <MODEL>         trofeo-9.16 (default, 1920x462) or trofeo-11.3 (1920x400)\n\
          \x20\x20--panel-size <WxH>      Picture size in pixels for any other panel (e.g. 1920x440)\n\
@@ -438,6 +472,9 @@ fn print_help() {
          \x20\x20--spectrum-rainbow-speed <DEG/S>  Hue scroll of the rainbow palette (default 30, 0 = static)\n\
          \x20\x20--config <FILE>          Config file (default: trofeo.conf in the program's\n\
          \x20\x20                          folder or the working folder)\n\
+         \x20\x20--start-in-tray           Start minimised: the console goes away and an icon in\n\
+         \x20\x20                          the tray shows / hides it (or use start_in_tray = true\n\
+         \x20\x20                          in the config file). Only applies on Windows.\n\
          \x20\x20--hide-console            Hide the terminal window as soon as the program\n\
          \x20\x20                          starts running. Handy when run via a shortcut/\n\
          \x20\x20                          Task Scheduler at login. Does not write logs\n\
@@ -549,6 +586,7 @@ fn parse_args() -> anyhow::Result<Config> {
     let mut openrgb_device: Option<String> = None;
     let mut openrgb_poll_ms = DEFAULT_OPENRGB_POLL_MS;
     let mut hide_console = false;
+    let mut start_in_tray_cli = false;
     let mut deepcool_enabled = true;
     let mut deepcool_update_ms = DEFAULT_DEEPCOOL_UPDATE_MS;
     let mut screenshot_key: Option<(u32, String)> = None;
@@ -607,6 +645,7 @@ fn parse_args() -> anyhow::Result<Config> {
                 deepcool_update_ms = next_u64(&mut args, "--deepcool-update-ms")?;
             }
             "--hide-console" => hide_console = true,
+            "--start-in-tray" => start_in_tray_cli = true,
             "--flip" => flip_cli = Some(true),
             "--margin" => margin_all = Some(next_u64(&mut args, "--margin")? as u32),
             "--margin-top" => m_top = Some(next_u64(&mut args, "--margin-top")? as u32),
@@ -733,8 +772,12 @@ fn parse_args() -> anyhow::Result<Config> {
     }
 
     // Priority: defaults < config file < command line.
-    let file = ConfigFile::load(config_path.as_deref()).map_err(|e| anyhow::anyhow!(e))?;
-    let (file, sensor_source) = trofeo_lcd::sensor_policy::configured(file, &overrides)
+    let mut file = ConfigFile::load(config_path.as_deref()).map_err(|e| anyhow::anyhow!(e))?;
+    for (k, v) in &overrides {
+        file.set(k, v);
+    }
+    file.apply_theme().map_err(|e| anyhow::anyhow!(e))?;
+    let (file, sensor_source) = trofeo_lcd::sensor_policy::configured(file, &[])
         .map_err(|e| anyhow::anyhow!(e))?;
     if !color_set {
         if let Some(v) = file.get("color") {
@@ -745,6 +788,15 @@ fn parse_args() -> anyhow::Result<Config> {
     if brightness > 100 {
         anyhow::bail!("brightness must be between 0 and 100");
     }
+    let night = parse_night(&file)?;
+    let profile_key = match file.get("profile_key").map(str::trim).filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("none")) {
+        None => None,
+        Some(raw) => {
+            let (mods, vk) = hotkey::parse_combo(raw).map_err(|e| anyhow::anyhow!("profile_key: {e}"))?;
+            Some((mods, vk, raw.to_ascii_lowercase()))
+        }
+    };
+    let profile_rules = trofeo_lcd::profiles::parse_rules(file.get("profile_rules").unwrap_or("")).map_err(|e| anyhow::anyhow!(e))?;
     // Peak amplitude (0.0-1.0) below which audio is considered "silent" (EQ
     // bars stay down, FPS drops to idle). Loopback capture reflects the
     // system/app volume, so a quiet listening level can dip under the
@@ -793,6 +845,11 @@ fn parse_args() -> anyhow::Result<Config> {
         Some(v) if v == "raster" || v == "picture" => false,
         Some(v) if v == "panel" => true,
         Some(v) => anyhow::bail!("hid_header: '{v}' not valid (raster | panel)"),
+    };
+    let hid_resend_ms = match file.get_u32("hid_resend_ms").map_err(|e| anyhow::anyhow!(e))? {
+        None => 0,
+        Some(v) if v <= 1000 => v,
+        Some(v) => anyhow::bail!("hid_resend_ms: must be 0..1000 (got {v})"),
     };
     let hid_big_endian = match file.get("hid_rgb565").map(|v| v.trim().to_ascii_lowercase()) {
         None => None,
@@ -850,6 +907,7 @@ fn parse_args() -> anyhow::Result<Config> {
     if !(1.0..=10.0).contains(&fps_driver_divisor) {
         anyhow::bail!("fps_driver_divisor: must be between 1 and 10 (got {fps_driver_divisor})");
     }
+    let start_in_tray = start_in_tray_cli || file.get_bool("start_in_tray").map_err(|e| anyhow::anyhow!(e))?.unwrap_or(false);
     let update_check = file.get_bool("update_check").map_err(|e| anyhow::anyhow!(e))?.unwrap_or(false);
     let update_check_hours = file.get_u32("update_check_hours").map_err(|e| anyhow::anyhow!(e))?.unwrap_or(0);
     if update_check_hours > 720 {
@@ -880,15 +938,20 @@ fn parse_args() -> anyhow::Result<Config> {
         openrgb_device,
         openrgb_poll_ms,
         hide_console,
+        start_in_tray,
         deepcool_enabled,
         deepcool_update_ms,
         screenshot_key,
+        profile_key,
+        profile_rules,
+        active_profile: file.profile.clone(),
         orientation,
         panel,
         panel_auto,
         flip,
         hid_mount,
         hid_header_panel,
+        hid_resend_ms,
         hid_big_endian,
         margins,
         language,
@@ -897,6 +960,7 @@ fn parse_args() -> anyhow::Result<Config> {
         background_color,
         ffmpeg,
         brightness: brightness as u8,
+        night,
         fps_monitor,
         bg_layout,
         ui,
@@ -929,6 +993,26 @@ const OVERRIDE_KEYS: &[&str] = &[
     "effect_speed", "effect_scale", "effect_brightness", "effect_fps", "effect_level", "effect_theme", "effect_flip", "effect_level_source", "effect_reactive",
     "panel", "panel_size", "font", "font_weight",
 ];
+
+/// The time of day as every clock of the program writes it: `14:05:09` or, with
+/// `clock_format = 12h`, `2:05:09 PM` (`clock_ampm = false` drops the AM / PM).
+fn fmt_clock(now: &chrono::DateTime<Local>, seconds: bool) -> String {
+    let o = opts();
+    clock_text(now.hour(), now.minute(), now.second(), seconds, o.clock_12h, o.clock_ampm)
+}
+
+fn clock_text(h: u32, m: u32, s: u32, seconds: bool, twelve: bool, ampm: bool) -> String {
+    let secs = if seconds { format!(":{s:02}") } else { String::new() };
+    if !twelve {
+        return format!("{h:02}:{m:02}{secs}");
+    }
+    let h12 = match h % 12 {
+        0 => 12,
+        v => v,
+    };
+    let suffix = if !ampm { "" } else if h < 12 { " AM" } else { " PM" };
+    format!("{h12}:{m:02}{secs}{suffix}")
+}
 
 /// Network (`net_unit`) and RAM (`mem_unit`) units.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -994,7 +1078,7 @@ fn item_key(key: &str) -> Option<(usize, &str)> {
 }
 
 fn is_override_key(key: &str) -> bool {
-    OVERRIDE_KEYS.contains(&key) || item_key(key).is_some() || key == "net_unit" || key == "mem_unit" || key == "ram_unit" || key == "nowplaying_width" || key == "nowplaying_label" || key == "fps_item" || key == "clock_backdrop" || key == "clock_time_size" || key == "clock_date_size" || key == "weather_unit" || key == "ticker_position" || key == "ticker_size" || key == "ticker_color" || key == "ticker_backdrop" || key == "ticker_width" || key == "percent_decimals" || key == "font" || key == "font_weight" || key == "tiles" || key.starts_with("tiles_") || key.starts_with("frame_") || key == "lhm" || key.starts_with("lhm_") || key.starts_with("dash_") || key == "deck" || key == "deck_gauge" || key == "cards" || key.starts_with("cards_") || key == "orbit" || key.starts_with("orbit_") || key == "console" || key.starts_with("console_") || key.starts_with("gaming_") || key.starts_with("steam_") || key.starts_with("hid_") || key == "deepcool_source" || key == "deepcool_mode" || key == "deepcool_fan" || key == "deepcool_alternate" || (key.starts_with("tile_") && key.ends_with("_color"))
+    OVERRIDE_KEYS.contains(&key) || item_key(key).is_some() || key == "net_unit" || key == "mem_unit" || key == "ram_unit" || key == "nowplaying_width" || key == "nowplaying_label" || key == "fps_item" || key == "clock_backdrop" || key == "clock_format" || key == "clock_ampm" || key == "theme" || key.starts_with("night_") || key.starts_with("alert_") || key.starts_with("profile") || key == "screen_fade_ms" || key == "screen_fade_style" || key == "clock_time_size" || key == "clock_date_size" || key == "weather_unit" || key == "ticker_position" || key == "ticker_size" || key == "ticker_color" || key == "ticker_backdrop" || key == "ticker_width" || key == "percent_decimals" || key == "font" || key == "font_weight" || key == "tiles" || key.starts_with("tiles_") || key.starts_with("frame_") || key == "lhm" || key.starts_with("lhm_") || key.starts_with("dash_") || key == "deck" || key == "deck_gauge" || key == "cards" || key.starts_with("cards_") || key == "orbit" || key.starts_with("orbit_") || key == "console" || key.starts_with("console_") || key.starts_with("gaming_") || key.starts_with("steam_") || key.starts_with("hid_") || key == "deepcool_source" || key == "deepcool_mode" || key == "deepcool_fan" || key == "deepcool_alternate" || (key.starts_with("tile_") && key.ends_with("_color"))
 }
 
 /// Style for a single item of the info block.
@@ -1087,8 +1171,10 @@ fn parse_ui_options(file: &ConfigFile) -> anyhow::Result<UiOptions> {
                 Some((n, s)) => (n.trim(), Some(s.trim())),
                 None => (entry, None),
             };
-            let def = layouts::find(name).ok_or_else(|| {
-                anyhow::anyhow!("layout: '{name}' unknown (valid: {})", layouts::names())
+            let def = layouts::find_any(name).ok_or_else(|| {
+                let own = trofeo_lcd::free::dir().map(|d| trofeo_lcd::free::list(&d)).unwrap_or_default();
+                let own = if own.is_empty() { String::new() } else { format!("; your own: {}", own.join(", ")) };
+                anyhow::anyhow!("layout: '{name}' unknown (valid: {}{own})", layouts::names())
             })?;
             let secs = match secs {
                 Some(s) => {
@@ -1207,6 +1293,22 @@ fn parse_ui_options(file: &ConfigFile) -> anyhow::Result<UiOptions> {
             Some(v) => anyhow::bail!("percent_decimals: must be 0 or 1 (got {v})"),
         },
         clock_backdrop: file.get_bool("clock_backdrop").map_err(|e| anyhow::anyhow!(e))?,
+        clock_12h: match file.get("clock_format").map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            None | Some("24h") | Some("24") => false,
+            Some("12h") | Some("12") => true,
+            Some(v) => anyhow::bail!("clock_format: '{v}' not valid (24h | 12h)"),
+        },
+        clock_ampm: file.get_bool("clock_ampm").map_err(|e| anyhow::anyhow!(e))?.unwrap_or(true),
+        screen_fade_ms: match file.get_u32("screen_fade_ms").map_err(|e| anyhow::anyhow!(e))? {
+            None => 0,
+            Some(v) if v <= fade::MAX_MS => v,
+            Some(v) => anyhow::bail!("screen_fade_ms: must be 0..{} (got {v})", fade::MAX_MS),
+        },
+        screen_fade_style: match file.get("screen_fade_style") {
+            None => fade::Style::Cross,
+            Some(v) => fade::Style::parse(v).ok_or_else(|| anyhow::anyhow!("screen_fade_style: '{}' not valid (cross | black)", v.trim()))?,
+        },
+        alerts: parse_alerts(file)?,
         clock_time_size: parse_size_opt(file, "clock_time_size", 20)?,
         clock_date_size: parse_size_opt(file, "clock_date_size", 6)?,
         show,
@@ -1794,10 +1896,13 @@ fn report_config_error(msg: &str) {
 }
 
 /// Config file signature, used to detect changes.
-fn config_stamp(explicit: Option<&std::path::Path>) -> Option<(std::path::PathBuf, std::time::SystemTime, u64)> {
+/// The configuration file's path, time and size, and which profile is selected (a change of
+/// either reloads the settings).
+fn config_stamp(explicit: Option<&std::path::Path>) -> Option<(std::path::PathBuf, std::time::SystemTime, u64, String)> {
     let p = ConfigFile::find_path(explicit)?;
     let m = std::fs::metadata(&p).ok()?;
-    Some((p, m.modified().ok()?, m.len()))
+    let pdir = trofeo_lcd::profiles::folder_of(&p);
+    Some((p, m.modified().ok()?, m.len(), trofeo_lcd::profiles::signature(pdir.as_deref())))
 }
 
 fn hex_head(b: &[u8], n: usize) -> String {
@@ -2058,6 +2163,10 @@ fn main() -> anyhow::Result<()> {
 
     let lcd = LyLcd::open()?;
     let mut hs = lcd.handshake()?;
+    // Everything that could fail at start-up is behind us: now the window can go to the tray.
+    if config.start_in_tray {
+        tray::start(ConfigFile::find_path(config.config_explicit.as_deref()));
+    }
     hs.rotate_180 = ROTATE_180_OVERRIDE;
     hs.rotation = config.orientation.output_rotation(config.flip);
     hs.brightness = config.brightness;
@@ -2201,6 +2310,26 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Profiles: a hotkey that goes round them (off unless `profile_key` is set), and the rules
+    // that pick one by the program in the foreground (off unless `profile_rules` is set).
+    let profiles_dir: Option<std::path::PathBuf> =
+        ConfigFile::find_path(config.config_explicit.as_deref()).and_then(|p| trofeo_lcd::profiles::folder_of(&p));
+    let mut profile_hotkey: Option<hotkey::Hotkey> = None;
+    if let Some((mods, vk, label)) = config.profile_key.clone() {
+        match hotkey::register_combo(mods, vk, 2) {
+            Ok(h) => {
+                println!("Profile hotkey: {} (global) — goes round the profiles", label.to_uppercase());
+                profile_hotkey = Some(h);
+            }
+            Err(e) => eprintln!("WARNING: profile hotkey not active: {e}"),
+        }
+    }
+    let mut rule_state = trofeo_lcd::profiles::RuleState::default();
+    let mut last_rule_check = Instant::now() - Duration::from_secs(10);
+    if let Some(p) = &config.active_profile {
+        println!("Profile: {p}");
+    }
+
     // AMD GPU sensor (Edge temperature, ASIC power, fan RPM) via ADL PMLog.
     // Graceful: if the driver isn't present / the GPU isn't AMD, a warning is printed and execution continues (N/A).
     let gpu_amd = gpu_amd::GpuAmdSensor::new();
@@ -2291,9 +2420,17 @@ fn main() -> anyhow::Result<()> {
     let mut ui_layouts = config.ui.layouts.clone();
     let mut layouts_started = Instant::now();
     let mut layout_index = usize::MAX;
+    let mut screen_fade = fade::Fade::new();
+    let mut previous_sensor_history = [None; 6];
+    let mut alert_state = trofeo_lcd::alerts::State::new();
+    let alert_epoch = Instant::now();
+    let share_dir: Option<std::path::PathBuf> =
+        ConfigFile::find_path(config.config_explicit.as_deref()).and_then(|p| p.parent().map(std::path::Path::to_path_buf));
+    let mut last_share_check = Instant::now();
     let mut layout_marquee = Marquee::new();
     let mut tiles_screen = tiles::TilesScreen::new();
     let mut frame_screen = frame::FrameScreen::new();
+    let mut free_screen = free_draw::FreeScreen::new();
     let mut dash_screen = tiles::dash::DashScreen::new();
     let mut game_screen = tiles::game::GameScreen::new();
     let mut game_tracker = game_info::Tracker::default();
@@ -2337,6 +2474,11 @@ fn main() -> anyhow::Result<()> {
 
     loop {
         let frame_start = Instant::now();
+        // Night mode (off by default): dimmer between night_start and night_end.
+        if config.night.on {
+            let now = Local::now();
+            hs.brightness = config.night.brightness_at(now.hour() * 60 + now.minute(), config.brightness);
+        }
 
         // Hot reload: if trofeo.conf changes, reapply the settings without restarting.
         if last_config_check.elapsed() >= Duration::from_secs(1) {
@@ -2354,7 +2496,9 @@ fn main() -> anyhow::Result<()> {
                             || new_cfg.fps_monitor != config.fps_monitor
                             || new_cfg.openrgb_device != config.openrgb_device
                             || new_cfg.hide_console != config.hide_console
+                            || new_cfg.start_in_tray != config.start_in_tray
                             || new_cfg.screenshot_key != config.screenshot_key
+                            || new_cfg.profile_key != config.profile_key
                             || new_cfg.weather_city != config.weather_city
                             || new_cfg.ticker_source != config.ticker_source
                             || new_cfg.ticker_refresh_min != config.ticker_refresh_min
@@ -2384,10 +2528,10 @@ fn main() -> anyhow::Result<()> {
                                         hs.big_endian = new_cfg.hid_big_endian.unwrap_or(hid_default_big_endian);
                                     }
                                 }
-                                println!("Configuration reloaded.");
+                                println!("Configuration reloaded.{}", new_cfg.active_profile.as_ref().map(|p| format!(" Profile: {p}.")).unwrap_or_default());
                                 report_config_error("");
                                 if restart_needed {
-                                    println!("(deepcool, fps_monitor, openrgb, hide_console, screenshot_key, weather_city, ticker_source, ticker_refresh_min and the update_* keys require a restart)");
+                                    println!("(deepcool, fps_monitor, openrgb, hide_console, start_in_tray, screenshot_key, weather_city, ticker_source, ticker_refresh_min and the update_* keys require a restart)");
                                 }
                                 config = new_cfg;
                             }
@@ -2397,6 +2541,29 @@ fn main() -> anyhow::Result<()> {
                     Err(e) => report_config_error(&format!("Configuration not applied (keeping the previous one): {e}")),
                 }
             }
+        }
+
+        // Profiles: the hotkey goes round them; the rules follow the program in the foreground.
+        // (With neither set, nothing here runs.)
+        if let (Some(h), Some(dir)) = (&profile_hotkey, &profiles_dir) {
+            if hotkey::triggered(h.id) {
+                let current = trofeo_lcd::profiles::selected(Some(dir), config.active_profile.as_deref());
+                let next = trofeo_lcd::profiles::next(dir, current.as_deref());
+                match trofeo_lcd::profiles::write_active(dir, next.as_deref()) {
+                    Ok(()) => println!("Profile: {}", next.as_deref().unwrap_or("none")),
+                    Err(e) => eprintln!("Profile not changed: {e}"),
+                }
+            }
+        }
+        if !config.profile_rules.is_empty() && last_rule_check.elapsed() >= Duration::from_secs(2) {
+            last_rule_check = Instant::now();
+            let matched = foreground::foreground_exe_name().and_then(|e| trofeo_lcd::profiles::rule_match(&config.profile_rules, &e));
+            let want = rule_state.update(matched, Instant::now());
+            if want != trofeo_lcd::profiles::auto() {
+                trofeo_lcd::profiles::set_auto(want);
+            }
+        } else if config.profile_rules.is_empty() && trofeo_lcd::profiles::auto().is_some() {
+            trofeo_lcd::profiles::set_auto(None); // the rules were taken away
         }
 
         // Screenshot hotkey (global — active even when the window doesn't have focus).
@@ -2409,6 +2576,20 @@ fn main() -> anyhow::Result<()> {
                     Err(e) => eprintln!("Failed to save screenshot: {e}"),
                 }
                 last_snap = Instant::now();
+            }
+        }
+
+        // "Share your design" (settings editor): a request file next to the configuration file
+        // asks for a PNG of what is on the screen. Looked for twice a second; costs nothing else.
+        if last_share_check.elapsed() >= Duration::from_millis(500) {
+            last_share_check = Instant::now();
+            if let Some(dir) = &share_dir {
+                if let Some(png) = share::take_request(dir) {
+                    match png_save::save_to(&fb, &png) {
+                        Ok(()) => println!("Picture for the gallery saved: {}", png.display()),
+                        Err(e) => eprintln!("Failed to save the picture for the gallery: {e}"),
+                    }
+                }
             }
         }
 
@@ -2531,6 +2712,20 @@ fn main() -> anyhow::Result<()> {
             (true, _) if !opts().tiles.fill_palettes.is_empty() => target_fps.max(5.0),
             _ => target_fps,
         };
+        // Fade between screens (`screen_fade_ms`, off by default): which screen is this frame?
+        // A different one than the last frame starts the fade, drawn at a steady pace.
+        let fade_ms = opts().screen_fade_ms;
+        let screen_id: u64 = if gaming_active && ui_show.dashboard {
+            1 + ((game_style.map_or(0, |s| s as u64) + 1) << 8)
+        } else if music_screen_on {
+            2 + ((music_style as u64) << 8)
+        } else if active_def.is_some() {
+            3 + ((layout_index as u64) << 8)
+        } else {
+            4 + ((is_idle as u64) << 8) + ((layout_index as u64) << 16)
+        };
+        screen_fade.begin(screen_id, fade_ms, opts().screen_fade_style, Instant::now());
+        let target_fps = if screen_fade.active(Instant::now()) { target_fps.max(config.active_fps) } else { target_fps };
         let target_frame_time = Duration::from_secs_f32(1.0 / target_fps);
 
         let bars = compute_bars(&samples, &hann, fft.as_ref(), &bar_bins, &mut running_max);
@@ -2673,6 +2868,8 @@ fn main() -> anyhow::Result<()> {
         }
         lhm::set_current(projected);
         dash_screen.set_hwinfo_history(hwinfo_display.history);
+        // A transition must never keep an unavailable or previous-generation sensor value visible.
+        retain_sensor_fade(&mut screen_fade, &mut previous_sensor_history, hwinfo_display.history);
         // "Gaming" mode detection (`gaming_active`: GPU usage above `gaming_gpu_percent`). Used for two things:
         // swap the "NOW PLAYING" content for the foreground exe name, AND replace the
         // EQ bar/clock area with the performance dashboard (see draw_game_dashboard).
@@ -2804,7 +3001,7 @@ fn main() -> anyhow::Result<()> {
                 ram_mb: Some((sys.used_memory() / 1024 / 1024, sys.total_memory() / 1024 / 1024)),
                 net_kb: Some(latest_net_kb),
                 disk_mb: Some(latest_disk_mb),
-                time: Local::now().format("%H:%M:%S").to_string(),
+                time: fmt_clock(&Local::now(), true),
                 uptime: format_uptime(System::uptime()),
             };
             music_layout_screen.draw(&mut fb, area, t, &bar_heights, peak_tracker.peaks(), &stats, &opts(), None);
@@ -2827,6 +3024,18 @@ fn main() -> anyhow::Result<()> {
             };
             let env = tiles::Env { fps: config.active_fps, ffmpeg: config.ffmpeg.as_deref(), effect: &config.ui.effect, secs: None };
             frame_screen.draw(&mut fb, area, wd, color_mode, &opts().frame, &opts().tiles, &env);
+        }
+        // A screen you designed (`layouts/<name>.layout`): painted on `fb` like the tiles.
+        if let (Some(name), Some(wd)) = (
+            active_def.filter(|_| is_idle && !(gaming_now && ui_show.dashboard)).and_then(|d| d.name.strip_prefix(layouts::FREE_PREFIX)),
+            widget_data.as_ref(),
+        ) {
+            let area = if composite {
+                (config.margins.left, config.margins.top, ui.width(), ui.height())
+            } else {
+                (0, 0, fb.width(), fb.height())
+            };
+            free_screen.draw(&mut fb, area, name, wd, color_mode);
         }
         let target: &mut Framebuffer = if composite { &mut ui } else { &mut fb };
         if game_style.is_some() {
@@ -2854,7 +3063,7 @@ fn main() -> anyhow::Result<()> {
                     ram_mb: Some((sys.used_memory() / 1024 / 1024, sys.total_memory() / 1024 / 1024)),
                     net_kb: Some(latest_net_kb),
                     disk_mb: Some(latest_disk_mb),
-                    time: Local::now().format("%H:%M:%S").to_string(),
+                    time: fmt_clock(&Local::now(), true),
                     uptime: format_uptime(System::uptime()),
                 };
                 music.draw(target, t, &bar_heights, peak_tracker.peaks(), &opts());
@@ -2916,6 +3125,30 @@ fn main() -> anyhow::Result<()> {
             fb.blit_ui(&ui, config.margins.left, config.margins.top, UI_KEY, panel);
         }
 
+        // Fade between screens: blends this picture with the previous one (not the banner).
+        screen_fade.finish(fb.as_bytes_mut(), fade_ms, Instant::now());
+
+        // Threshold alerts (every limit is 0 = off by default: then nothing runs).
+        {
+            let rules = opts().alerts;
+            if rules.any() {
+                let used = sys.used_memory() as f32;
+                let total = sys.total_memory().max(1) as f32;
+                let reading = trofeo_lcd::alerts::Reading {
+                    cpu_temp: latest_cpu_temp,
+                    gpu_temp: latest_gpu_data.temp_edge_c.map(|t| t as f32),
+                    cpu_load: Some(sys.global_cpu_info().cpu_usage()),
+                    gpu_load: latest_gpu_percent,
+                    ram: Some(used * 100.0 / total),
+                };
+                if let Some(a) = alert_state.update(&rules, Instant::now(), &reading) {
+                    trofeo_lcd::alerts::draw(&mut fb, &a, rules.color, alert_epoch.elapsed().as_millis());
+                }
+            } else {
+                alert_state.update(&rules, Instant::now(), &Default::default());
+            }
+        }
+
         hwinfo_display.draw(&mut fb);
         // The "new version available" banner, on top of everything, for a few seconds.
         if let Some(v) = update_monitor.take_new() {
@@ -2936,6 +3169,8 @@ fn main() -> anyhow::Result<()> {
         // active — can differ each iteration), without forcing it if it's
         // actually slower than that.
         let elapsed = frame_start.elapsed();
+        // HID screens that blank between pictures: a thread keeps sending the last one.
+        lcd.set_hid_resend_ms(config.hid_resend_ms);
         if elapsed < target_frame_time {
             std::thread::sleep(target_frame_time - elapsed);
         }
@@ -3135,7 +3370,7 @@ fn render_preview(config: &Config, req: &PreviewReq) -> anyhow::Result<Framebuff
             ram_mb: Some((wd.used_mb, wd.total_mb)),
             net_kb: Some(wd.net_kb),
             disk_mb: Some(wd.disk_mb),
-            time: Local::now().format("%H:%M:%S").to_string(),
+            time: fmt_clock(&Local::now(), true),
             uptime: format_uptime(System::uptime()),
         };
         let track = media::TrackInfo {
@@ -3158,6 +3393,14 @@ fn render_preview(config: &Config, req: &PreviewReq) -> anyhow::Result<Framebuff
         screen.still = true;
         screen.draw_settled(&mut fb, area, &wd, color_mode, &o.frame, &o.tiles, &env);
     }
+    if let Some(name) = active_def.filter(|_| is_idle).and_then(|d| d.name.strip_prefix(layouts::FREE_PREFIX)) {
+        let area = if composite {
+            (config.margins.left, config.margins.top, ui.width(), ui.height())
+        } else {
+            (0, 0, fb.width(), fb.height())
+        };
+        free_draw::FreeScreen::new().draw(&mut fb, area, name, &wd, color_mode);
+    }
     let target: &mut Framebuffer = if composite { &mut ui } else { &mut fb };
 
     if game_style.is_some() {
@@ -3176,7 +3419,7 @@ fn render_preview(config: &Config, req: &PreviewReq) -> anyhow::Result<Framebuff
             ram_mb: Some((wd.used_mb, wd.total_mb)),
             net_kb: Some(wd.net_kb),
             disk_mb: Some(wd.disk_mb),
-            time: Local::now().format("%H:%M:%S").to_string(),
+            time: fmt_clock(&Local::now(), true),
             uptime: format_uptime(System::uptime()),
         };
         let track = media::TrackInfo {
@@ -3369,6 +3612,13 @@ struct UiOptions {
     text_backdrop: bool,
     items: [ItemStyle; 12],
     /// Maximum scale of the large clock's time and date.
+    /// `clock_format = 12h`: every clock shows 2:05 PM instead of 14:05.
+    clock_12h: bool,
+    /// With 12h, the AM / PM after the time (`clock_ampm`).
+    clock_ampm: bool,
+    /// Fade between screens, in ms (0 = off): see `fade.rs`.
+    screen_fade_ms: u32,
+    screen_fade_style: fade::Style,
     clock_time_size: u32,
     clock_date_size: u32,
     /// Panel behind the large clock (None = follows `text_backdrop`).
@@ -3376,6 +3626,8 @@ struct UiOptions {
     /// Maximum width (% of the canvas) of the track line in items mode.
     nowplaying_width: u32,
     net_unit: NetUnit,
+    /// Threshold alerts (all off by default).
+    alerts: trofeo_lcd::alerts::Rules,
     mem_gb: bool,
     /// Show the "NOW PLAYING:" label before the title (items mode).
     nowplaying_label: bool,
@@ -3480,6 +3732,11 @@ impl Default for UiOptions {
             net_unit: NetUnit::Kb,
             mem_gb: false,
             nowplaying_label: true,
+            clock_12h: false,
+            clock_ampm: true,
+            screen_fade_ms: 0,
+            screen_fade_style: fade::Style::Cross,
+            alerts: Default::default(),
             clock_time_size: 20,
             clock_date_size: 6,
             weather_fahrenheit: false,
@@ -3581,6 +3838,94 @@ fn default_areas(fb: &Framebuffer) -> ((u32, u32, u32, u32), Option<(u32, u32, u
     let main = (c.0, c.1, c.2, c.3 - gh - GAP);
     let game = (c.0 + INSET, c.1 + c.3 - gh, c.2.saturating_sub(2 * INSET), gh);
     (main, Some(game))
+}
+
+/// Night mode: from `start` to `end` (minutes since midnight; the window may cross midnight)
+/// the picture is dimmed to `brightness` percent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Night {
+    on: bool,
+    start: u32,
+    end: u32,
+    brightness: u8,
+}
+
+impl Default for Night {
+    fn default() -> Night {
+        Night { on: false, start: 23 * 60, end: 7 * 60, brightness: 20 }
+    }
+}
+
+impl Night {
+    /// Is `minute` (since midnight) inside the night window? Equal start and end = never.
+    fn active_at(&self, minute: u32) -> bool {
+        if !self.on || self.start == self.end {
+            return false;
+        }
+        if self.start < self.end {
+            (self.start..self.end).contains(&minute)
+        } else {
+            minute >= self.start || minute < self.end
+        }
+    }
+
+    /// The brightness to use at `minute`, given the normal one.
+    fn brightness_at(&self, minute: u32, normal: u8) -> u8 {
+        if self.active_at(minute) { self.brightness.min(normal) } else { normal }
+    }
+}
+
+/// `HH:MM` (also `H:MM`) as minutes since midnight.
+fn parse_hhmm(s: &str) -> Option<u32> {
+    let (h, m) = s.trim().split_once(':')?;
+    let (h, m): (u32, u32) = (h.trim().parse().ok()?, m.trim().parse().ok()?);
+    (h < 24 && m < 60).then_some(h * 60 + m)
+}
+
+fn parse_alerts(file: &ConfigFile) -> anyhow::Result<trofeo_lcd::alerts::Rules> {
+    let mut r = trofeo_lcd::alerts::Rules::default();
+    let mut limit = |key: &str, max: u32| -> anyhow::Result<u32> {
+        match file.get_u32(key).map_err(|e| anyhow::anyhow!(e))? {
+            None => Ok(0),
+            Some(v) if v <= max => Ok(v),
+            Some(v) => anyhow::bail!("{key}: must be 0..{max} (got {v}); 0 = off"),
+        }
+    };
+    r.cpu_temp = limit("alert_cpu_temp", 150)?;
+    r.gpu_temp = limit("alert_gpu_temp", 150)?;
+    r.cpu_load = limit("alert_cpu_load", 100)?;
+    r.gpu_load = limit("alert_gpu_load", 100)?;
+    r.ram = limit("alert_ram", 100)?;
+    if let Some(d) = file.get_u32("alert_delay").map_err(|e| anyhow::anyhow!(e))? {
+        if d > trofeo_lcd::alerts::MAX_DELAY_SECS {
+            anyhow::bail!("alert_delay: must be 0..{} seconds (got {d})", trofeo_lcd::alerts::MAX_DELAY_SECS);
+        }
+        r.delay_secs = d;
+    }
+    if let Some(c) = parse_color_opt(file, "alert_color")? {
+        r.color = c;
+    }
+    Ok(r)
+}
+
+fn parse_night(file: &ConfigFile) -> anyhow::Result<Night> {
+    let d = Night::default();
+    let time = |key: &str, def: u32| -> anyhow::Result<u32> {
+        match file.get(key) {
+            None => Ok(def),
+            Some(v) => parse_hhmm(v).ok_or_else(|| anyhow::anyhow!("{key}: '{v}' not valid (HH:MM, for example 23:00)")),
+        }
+    };
+    let brightness = file.get_u32("night_brightness").map_err(|e| anyhow::anyhow!(e))?.unwrap_or(d.brightness as u32);
+    if brightness > 100 {
+        anyhow::bail!("night_brightness must be between 0 and 100");
+    }
+    Ok(Night {
+        on: file.get_bool("night_mode").map_err(|e| anyhow::anyhow!(e))?.unwrap_or(false),
+        start: time("night_start", d.start)?,
+        end: time("night_end", d.end)?,
+        brightness: brightness as u8,
+    })
 }
 
 fn opts() -> UiOptions {
@@ -3963,7 +4308,7 @@ fn draw_idle_clock(fb: &mut Framebuffer, color_mode: ColorMode) {
 
     // Each line is resized to fit within the canvas width.
     let max_w = width.saturating_sub(40);
-    let time_str = now.format("%H:%M:%S").to_string();
+    let time_str = fmt_clock(&now, true);
     let mut lines: Vec<(String, u32)> = vec![(time_str, o.clock_time_size)];
     if o.show.clock_date {
         if is_portrait(fb) {
@@ -4114,7 +4459,7 @@ fn draw_status_lines(
     let used_mb = sys.used_memory() / 1024 / 1024;
     let total_mb = sys.total_memory() / 1024 / 1024;
     let uptime_str = format_uptime(System::uptime());
-    let time_str = now.format("%H:%M:%S").to_string();
+    let time_str = fmt_clock(&now, true);
     let date_str = now.format("%Y-%m-%d").to_string();
 
     let gpu_str = gpu_percent.map_or_else(|| "N/A".to_string(), fmt_pct);
@@ -4541,7 +4886,7 @@ mod layout_tests {
     }
 
     fn sample(fb: &mut Framebuffer) {
-        let sys = System::new_all();
+        let sys = System::new();
         let gpu = gpu_amd::GpuAmdData::default();
         let mut marquee = Marquee::new();
         fb.clear(0x08, 0x08, 0x10);
@@ -4618,7 +4963,7 @@ mod layout_tests {
                 }
             }
             // The default screen with the pixel game strip.
-            let sys = System::new_all();
+            let sys = System::new();
             let gpu = gpu_amd::GpuAmdData::default();
             let mut o2 = parse_ui_options(&ConfigFile::parse("").unwrap()).unwrap();
             o2.status_style = StatusStyle::Lines;
@@ -4953,6 +5298,73 @@ mod layout_tests {
     }
 
     #[test]
+    fn the_clock_can_be_written_in_12_hours() {
+        assert_eq!(clock_text(14, 5, 9, true, false, true), "14:05:09");
+        assert_eq!(clock_text(0, 5, 9, false, false, true), "00:05");
+        assert_eq!(clock_text(14, 5, 9, true, true, true), "2:05:09 PM");
+        assert_eq!(clock_text(0, 30, 0, false, true, true), "12:30 AM");
+        assert_eq!(clock_text(12, 0, 0, false, true, true), "12:00 PM");
+        assert_eq!(clock_text(23, 59, 0, false, true, false), "11:59");
+        assert_eq!(clock_text(9, 7, 0, false, true, true), "9:07 AM");
+        let o = parse_ui_options(&ConfigFile::parse("clock_format = 12h\nclock_ampm = no\n").unwrap()).unwrap();
+        assert!(o.clock_12h && !o.clock_ampm);
+        let d = parse_ui_options(&ConfigFile::parse("").unwrap()).unwrap();
+        assert!(!d.clock_12h && d.clock_ampm);
+        assert!(parse_ui_options(&ConfigFile::parse("clock_format = 13h\n").unwrap()).is_err());
+        assert!(is_override_key("clock_format") && is_override_key("clock_ampm"));
+    }
+
+    #[test]
+    fn alert_options_are_parsed_checked_and_off_by_default() {
+        let a = |t: &str| parse_alerts(&ConfigFile::parse(t).unwrap());
+        assert!(!a("").unwrap().any());
+        let r = a("alert_cpu_temp = 90\nalert_ram = 95\nalert_delay = 5\nalert_color = 255,160,0\n").unwrap();
+        assert_eq!((r.cpu_temp, r.ram, r.delay_secs, r.color), (90, 95, 5, (255, 160, 0)));
+        for bad in ["alert_cpu_temp = 151\n", "alert_ram = 101\n", "alert_delay = 601\n", "alert_gpu_load = x\n", "alert_color = nope\n"] {
+            assert!(a(bad).is_err(), "{bad}");
+        }
+        assert!(is_override_key("alert_cpu_temp") && is_override_key("alert_delay"));
+    }
+
+    #[test]
+    fn night_mode_dims_between_two_times_also_across_midnight() {
+        let f = |t: &str| parse_night(&ConfigFile::parse(t).unwrap()).unwrap();
+        assert!(!f("").on, "off by default");
+        let n = f("night_mode = true\nnight_start = 22:30\nnight_end = 06:00\nnight_brightness = 15\n");
+        assert!(n.active_at(23 * 60) && n.active_at(0) && n.active_at(5 * 60 + 59));
+        assert!(!n.active_at(6 * 60) && !n.active_at(12 * 60) && !n.active_at(22 * 60 + 29));
+        assert_eq!(n.brightness_at(23 * 60, 100), 15);
+        assert_eq!(n.brightness_at(12 * 60, 100), 100);
+        assert_eq!(n.brightness_at(23 * 60, 10), 10, "never brighter than the normal one");
+        let day = f("night_mode = true\nnight_start = 09:00\nnight_end = 17:00\n");
+        assert!(day.active_at(12 * 60) && !day.active_at(8 * 60) && !day.active_at(17 * 60));
+        assert!(!f("night_mode = true\nnight_start = 08:00\nnight_end = 08:00\n").active_at(8 * 60), "equal times = never");
+        assert!(!f("night_start = 23:00\n").active_at(23 * 60 + 30), "needs night_mode");
+        for bad in ["night_start = 25:00\n", "night_end = 7\n", "night_start = ab:cd\n", "night_brightness = 101\n"] {
+            assert!(parse_night(&ConfigFile::parse(bad).unwrap()).is_err(), "{bad}");
+        }
+        assert_eq!(parse_hhmm(" 7:05 "), Some(7 * 60 + 5));
+    }
+
+    #[test]
+    fn the_hid_resend_option_is_a_known_key_and_off_by_default() {
+        assert!(is_override_key("hid_resend_ms"));
+        let f = trofeo_lcd::schema::fields().into_iter().find(|f| f.key == "hid_resend_ms").expect("in the editor");
+        assert_eq!(f.default, "0");
+    }
+
+    #[test]
+    fn the_screen_fade_is_off_by_default_and_checked() {
+        let d = parse_ui_options(&ConfigFile::parse("").unwrap()).unwrap();
+        assert_eq!((d.screen_fade_ms, d.screen_fade_style), (0, fade::Style::Cross));
+        let o = parse_ui_options(&ConfigFile::parse("screen_fade_ms = 600\nscreen_fade_style = black\n").unwrap()).unwrap();
+        assert_eq!((o.screen_fade_ms, o.screen_fade_style), (600, fade::Style::Black));
+        assert!(parse_ui_options(&ConfigFile::parse("screen_fade_ms = 5001\n").unwrap()).is_err());
+        assert!(parse_ui_options(&ConfigFile::parse("screen_fade_style = wipe\n").unwrap()).is_err());
+        assert!(is_override_key("screen_fade_ms") && is_override_key("screen_fade_style"));
+    }
+
+    #[test]
     fn music_screen_options_parse() {
         let parse = |t: &str| parse_ui_options(&ConfigFile::parse(t).unwrap());
         let d = parse("").unwrap();
@@ -4995,7 +5407,7 @@ mod layout_tests {
     /// screen and on the per-item "default2" one, and nothing is drawn on top of it.
     #[test]
     fn pixel_game_strip_shares_the_default_and_default2_screens() {
-        let sys = System::new_all();
+        let sys = System::new();
         let gpu = gpu_amd::GpuAmdData::default();
         let configs = [
             ("classic", ""),
@@ -5213,8 +5625,11 @@ mod layout_tests {
     fn schema_names_match_the_program() {
         use trofeo_lcd::schema::*;
         // layouts
-        let names: Vec<&str> = layouts::LAYOUTS.iter().map(|l| l.name).collect();
+        let names: Vec<&str> = layouts::LAYOUTS.iter().map(|l| l.name).chain(trofeo_lcd::free::BUILTIN.iter().map(|b| b.0)).collect();
         assert_eq!(LAYOUT_NAMES.iter().map(|(n, _, _)| *n).collect::<Vec<_>>(), names);
+        for (n, en, it, _) in trofeo_lcd::free::BUILTIN {
+            assert!(LAYOUT_NAMES.iter().any(|l| l.0 == *n && l.1 == *en && l.2 == *it), "{n}");
+        }
         // tiles
         assert_eq!(TILE_KINDS.iter().map(|(n, _, _)| *n).collect::<Vec<_>>(), tiles::Kind::ALL.iter().map(|k| k.key()).collect::<Vec<_>>());
         // colors
@@ -5234,7 +5649,7 @@ mod layout_tests {
         }
         // every key of the editor is one the program reads from the config file
         let from_cli_or_file = |k: &str| is_override_key(k) || trofeo_lcd::sensor_policy::cli_key(&format!("--{}", k.replace('_', "-"))).is_some() || ["orientation", "flip", "panel_size", "background", "background_dim", "ffmpeg", "language",
-            "hid_mount", "hid_header", "color", "silence_threshold", "silence_timeout_ms", "weather_city", "ticker_source", "ticker_refresh_min", "gpu_usage_source", "fps_source", "fps_driver_divisor", "update_check", "update_check_hours", "update_notice_secs", "margin", "margin_top", "margin_bottom", "margin_left", "margin_right"].contains(&k);
+            "hid_mount", "hid_header", "hid_resend_ms", "color", "silence_threshold", "silence_timeout_ms", "weather_city", "ticker_source", "ticker_refresh_min", "gpu_usage_source", "fps_source", "fps_driver_divisor", "update_check", "update_check_hours", "update_notice_secs", "start_in_tray", "margin", "margin_top", "margin_bottom", "margin_left", "margin_right"].contains(&k);
         for f in fields() {
             assert!(from_cli_or_file(&f.key), "{} is not a key of the program", f.key);
         }
@@ -5613,7 +6028,7 @@ mod layout_tests {
             city: Some("Milano".into()),
             forecast: sample_forecast(),
         };
-        let sys = System::new_all();
+        let sys = System::new();
         let gpu = gpu_amd::GpuAmdData::default();
         for (name, orient, o, idle) in scenarios {
             TEST_OPTS.with(|t| *t.borrow_mut() = Some(o));
@@ -5651,7 +6066,7 @@ mod layout_tests {
         let (iw, ih) = margins.inner(canvas.width, canvas.height).unwrap();
         let mut ui = Framebuffer::new(trofeo_lcd::Resolution::new(iw, ih));
         ui.clear(1, 0, 2);
-        let sys = System::new_all();
+        let sys = System::new();
         let gpu = gpu_amd::GpuAmdData::default();
         let mut marquee = Marquee::new();
         draw_bars(&mut ui, &vec![0.5f32; NUM_BARS], &vec![0.5f32; NUM_BARS], ColorMode::Default);
@@ -5697,5 +6112,42 @@ mod update_banner_tests {
             let white = (h / 2..h).any(|y| (0..w).any(|x| px(x, y) == vec![255, 255, 255]));
             assert!(white, "no text on {w}x{h}");
         }
+    }
+}
+
+#[cfg(test)]
+mod hwinfo_fade_tests {
+    use super::*;
+    use trofeo_lcd::{sensor_display::HistoryKey, sensor_policy::HwinfoSelector};
+
+    #[test]
+    fn sensor_loss_and_generation_changes_discard_old_fade_pixels() {
+        let key = HistoryKey { identity: HwinfoSelector { sensor_id: 1, sensor_instance: 2, reading_id: 3 }, generation: 1, publisher_poll: Some(1), usable: true };
+        for changed in [HistoryKey { usable: false, ..key }, HistoryKey { generation: 2, ..key }] {
+            let now = Instant::now();
+            let mut fade = fade::Fade::new();
+            fade.begin(1, 1000, fade::Style::Cross, now);
+            fade.finish(&mut [255; 3], 1000, now);
+            fade.begin(2, 1000, fade::Style::Cross, now);
+            assert!(fade.active(now));
+            let mut previous = [Some(key); 6];
+            retain_sensor_fade(&mut fade, &mut previous, [Some(changed); 6]);
+            let mut frame = [0; 3];
+            fade.finish(&mut frame, 1000, now);
+            assert_eq!(frame, [0; 3]);
+            assert!(!fade.active(now));
+        }
+    }
+
+    #[test]
+    fn publisher_progress_within_a_generation_keeps_the_transition() {
+        let now = Instant::now();
+        let key = HistoryKey { identity: HwinfoSelector { sensor_id: 1, sensor_instance: 2, reading_id: 3 }, generation: 1, publisher_poll: Some(1), usable: true };
+        let mut fade = fade::Fade::new();
+        fade.begin(1, 1000, fade::Style::Cross, now);
+        fade.finish(&mut [255; 3], 1000, now);
+        fade.begin(2, 1000, fade::Style::Cross, now);
+        retain_sensor_fade(&mut fade, &mut [Some(key); 6], [Some(HistoryKey { publisher_poll: Some(2), ..key }); 6]);
+        assert!(fade.active(now));
     }
 }

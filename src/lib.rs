@@ -62,6 +62,11 @@ pub mod layout;
 pub mod hotkey;
 pub mod hid2;
 pub mod png_save;
+pub mod share;
+pub mod themes;
+pub mod alerts;
+pub mod profiles;
+pub mod free;
 
 pub const VENDOR_ID: u16 = 0x0416;
 /// Trofeo Vision 9.16 LCD.
@@ -373,7 +378,7 @@ pub struct LyLcd {
     /// USB handle of the LY family (`None` for the HID family).
     handle: Option<DeviceHandle<Context>>,
     /// HID device of the 0416:5302 family.
-    hid: Option<hidapi::HidDevice>,
+    hid: Option<std::sync::Arc<HidShared>>,
     iface: u8,
     variant: Variant,
     /// Bulk OUT & IN endpoint addresses, auto-detected from the USB device
@@ -382,6 +387,43 @@ pub struct LyLcd {
     /// notes above about 0x01 vs 0x09).
     ep_write: u8,
     ep_read: u8,
+}
+
+/// What the HID screen shares between the drawing thread and the thread that keeps sending the
+/// last picture (`hid_resend_ms`).
+struct HidShared {
+    /// The device; held for a whole frame so two frames never interleave.
+    dev: std::sync::Mutex<hidapi::HidDevice>,
+    /// The last frame written (header + JPEG, padded to 512).
+    last: std::sync::Mutex<std::sync::Arc<Vec<u8>>>,
+    /// Pause between repeats in ms (0 = no repeating).
+    resend_ms: std::sync::atomic::AtomicU32,
+    /// A new frame is waiting to be written: the repeating thread steps aside.
+    pending: std::sync::atomic::AtomicU32,
+    started: std::sync::atomic::AtomicBool,
+    stop: std::sync::atomic::AtomicBool,
+}
+
+impl HidShared {
+    /// Write one frame as 512-byte reports (report id 0 in front), all under the device lock.
+    fn write_frame(&self, frame: &[u8]) -> Result<()> {
+        let dev = self.dev.lock().map_err(|_| LcdError::Hid("HID device lock poisoned".into()))?;
+        let mut report = vec![0u8; 1 + hid2::REPORT_SIZE];
+        for chunk in frame.chunks(hid2::REPORT_SIZE) {
+            report[1..1 + chunk.len()].copy_from_slice(chunk);
+            report[1 + chunk.len()..].fill(0);
+            dev.write(&report).map_err(|e| LcdError::Hid(e.to_string()))?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for LyLcd {
+    fn drop(&mut self) {
+        if let Some(h) = &self.hid {
+            h.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }
 
 /// Endpoint info detected on one interface — used by `open()` and
@@ -465,7 +507,15 @@ impl LyLcd {
         let dev = api
             .open(hid2::VENDOR_ID, hid2::PRODUCT_ID)
             .map_err(|e| LcdError::Hid(format!("cannot open 0416:5302 ({e}). Close the vendor program (TRCC) if it is running; on Linux install the udev rule")))?;
-        Ok(Self { handle: None, hid: Some(dev), iface: 0, variant: Variant::Hid2, ep_write: 0, ep_read: 0 })
+        let shared = std::sync::Arc::new(HidShared {
+            dev: std::sync::Mutex::new(dev),
+            last: std::sync::Mutex::new(std::sync::Arc::new(Vec::new())),
+            resend_ms: std::sync::atomic::AtomicU32::new(0),
+            pending: std::sync::atomic::AtomicU32::new(0),
+            started: std::sync::atomic::AtomicBool::new(false),
+            stop: std::sync::atomic::AtomicBool::new(false),
+        });
+        Ok(Self { handle: None, hid: Some(shared), iface: 0, variant: Variant::Hid2, ep_write: 0, ep_read: 0 })
     }
 
     pub fn variant(&self) -> Variant {
@@ -569,9 +619,10 @@ impl LyLcd {
     /// HID family handshake: the request is retried a few times (the screen can still be
     /// starting), the reply is checked and the model read from it.
     fn handshake_hid(&self) -> Result<Handshake> {
-        let dev = self.hid.as_ref().expect("HID device");
+        let shared = self.hid.as_ref().expect("HID device");
         let mut last = Vec::new();
         for attempt in 0..4 {
+            let dev = shared.dev.lock().map_err(|_| LcdError::Hid("HID device lock poisoned".into()))?;
             if attempt > 0 {
                 std::thread::sleep(Duration::from_millis(500));
             }
@@ -640,14 +691,53 @@ impl LyLcd {
 
     /// HID family: a frame goes out as 512-byte reports (report id 0 in front).
     fn write_frame_hid(&self, frame: &[u8]) -> Result<()> {
-        let dev = self.hid.as_ref().expect("HID device");
-        let mut report = vec![0u8; 1 + hid2::REPORT_SIZE];
-        for chunk in frame.chunks(hid2::REPORT_SIZE) {
-            report[1..1 + chunk.len()].copy_from_slice(chunk);
-            report[1 + chunk.len()..].fill(0);
-            dev.write(&report).map_err(|e| LcdError::Hid(e.to_string()))?;
+        use std::sync::atomic::Ordering::Relaxed;
+        let shared = self.hid.as_ref().expect("HID device");
+        // the repeating thread steps aside while this frame is written
+        shared.pending.fetch_add(1, Relaxed);
+        let r = shared.write_frame(frame);
+        shared.pending.fetch_sub(1, Relaxed);
+        r?;
+        if let Ok(mut last) = shared.last.lock() {
+            *last = std::sync::Arc::new(frame.to_vec());
         }
         Ok(())
+    }
+
+    /// HID screens: keep sending the last picture again every `ms` milliseconds (0 = off), from
+    /// a thread of its own, also while the next picture is being drawn and encoded. Some panels
+    /// blank when no data arrives for a moment: see `hid_resend_ms`. Cheap to call every frame.
+    pub fn set_hid_resend_ms(&self, ms: u32) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(shared) = &self.hid else { return };
+        shared.resend_ms.store(ms, Relaxed);
+        if ms == 0 || shared.started.swap(true, Relaxed) {
+            return;
+        }
+        let sh = std::sync::Arc::clone(shared);
+        std::thread::spawn(move || {
+            while !sh.stop.load(Relaxed) {
+                let ms = sh.resend_ms.load(Relaxed);
+                let frame = sh.last.lock().map(|g| std::sync::Arc::clone(&g)).unwrap_or_default();
+                if ms == 0 || frame.is_empty() {
+                    std::thread::sleep(Duration::from_millis(20));
+                    continue;
+                }
+                // a new picture is waiting to go out: let it through first
+                while sh.pending.load(Relaxed) > 0 && !sh.stop.load(Relaxed) {
+                    std::thread::sleep(Duration::from_micros(200));
+                }
+                let t = std::time::Instant::now();
+                if sh.write_frame(&frame).is_err() {
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+                let step = Duration::from_millis(ms as u64);
+                if t.elapsed() < step {
+                    std::thread::sleep(step - t.elapsed());
+                }
+            }
+        });
     }
 
     /// Send a single frame. For this panel, `payload` must be already-encoded

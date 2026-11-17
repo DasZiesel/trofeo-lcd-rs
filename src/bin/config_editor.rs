@@ -16,6 +16,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
+#[path = "config_editor/builder.rs"]
+mod builder;
+
+use trofeo_lcd::share;
 use trofeo_lcd::conf_edit::ConfDoc;
 use trofeo_lcd::schema::{self, Field, Kind};
 
@@ -528,7 +532,11 @@ fn run_as_invoker(cmd: &mut std::process::Command) {
 }
 
 /// Runs the main program once to draw a frame of `text` (the configuration being edited).
-fn render_preview(exe: &Path, text: &str, workdir: &Path, state: PreviewState, layout: usize, secs: f64) -> Result<Rendered, String> {
+fn dir_of(path: &Path) -> std::path::PathBuf {
+    path.parent().map(Path::to_path_buf).unwrap_or_default()
+}
+
+fn render_preview(exe: &Path, text: &str, workdir: &Path, state: PreviewState, layout: usize, secs: f64, keep: Option<&Path>) -> Result<Rendered, String> {
     let tmp = std::env::temp_dir();
     let id = std::process::id();
     let conf = tmp.join(format!("trofeo_config_{id}.conf"));
@@ -539,6 +547,11 @@ fn render_preview(exe: &Path, text: &str, workdir: &Path, state: PreviewState, l
     let mut cmd = std::process::Command::new(exe);
     if invoker {
         run_as_invoker(&mut cmd);
+    }
+    if !workdir.as_os_str().is_empty() {
+        // the themes of your own are next to the real file, not next to the temporary one
+        cmd.env(trofeo_lcd::themes::ENV_DIR, workdir.join(trofeo_lcd::themes::FOLDER));
+        cmd.env(trofeo_lcd::free::ENV_DIR, workdir.join(trofeo_lcd::free::FOLDER));
     }
     cmd.arg("--config")
         .arg(&conf)
@@ -575,6 +588,12 @@ fn render_preview(exe: &Path, text: &str, workdir: &Path, state: PreviewState, l
     }
     let bytes = std::fs::read(&png).map_err(|e| format!("no picture was produced: {e}"))?;
     let _ = std::fs::remove_file(&png);
+    if let Some(dest) = keep {
+        if let Some(d) = dest.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        std::fs::write(dest, &bytes).map_err(|e| format!("cannot save the picture: {e}"))?;
+    }
     let img = image::load_from_memory(&bytes).map_err(|e| format!("cannot read the picture: {e}"))?.to_rgba8();
     let size = [img.width() as usize, img.height() as usize];
     Ok(Rendered { image: egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw()) })
@@ -739,6 +758,17 @@ fn layout_widget(ui: &mut egui::Ui, ed: &mut Ed, key: &str, l: Lang) {
                 for (name, en, it) in schema::LAYOUT_NAMES {
                     if ui.selectable_label(e.name == *name, format!("{name}  -  {}", tr(l, en, it))).clicked() {
                         e.name = name.to_string();
+                        changed = true;
+                    }
+                }
+                // the screens you designed (Layout builder)
+                let own: Vec<String> = trofeo_lcd::free::dir().map(|d| trofeo_lcd::free::list(&d)).unwrap_or_default().into_iter().filter(|n| trofeo_lcd::free::builtin(n).is_none()).collect();
+                if !own.is_empty() {
+                    ui.separator();
+                }
+                for name in own {
+                    if ui.selectable_label(e.name == name, format!("{name}  -  {}", tr(l, "your own", "tuo"))).clicked() {
+                        e.name = name;
                         changed = true;
                     }
                 }
@@ -1094,6 +1124,18 @@ fn field_widget(ui: &mut egui::Ui, ed: &mut Ed, f: &Field, l: Lang) {
                         ed.set(&f.key, o);
                     }
                 }
+                if f.key == "theme" {
+                    // the themes of your own, from the themes folder next to the file
+                    let own = trofeo_lcd::themes::user_dir().map(|d| trofeo_lcd::themes::list_user(&d)).unwrap_or_default();
+                    if !own.is_empty() {
+                        ui.separator();
+                    }
+                    for o in own {
+                        if ui.selectable_label(eff == o, &o).clicked() {
+                            ed.set(&f.key, &o);
+                        }
+                    }
+                }
             });
         }
         Kind::Int { min, max } => {
@@ -1209,6 +1251,45 @@ struct App {
     hwinfo_search: String,
     hwinfo_options: Result<trofeo_lcd::hwinfo_provider::Options, String>,
     sensor_editor_only: bool,
+    share: ShareState,
+    /// The search box of the side list.
+    query: String,
+    /// Show only the settings that are set in the file.
+    only_changed: bool,
+    /// A category of the side list to open on the next frame (after a jump from a search).
+    open_cat: Option<usize>,
+    /// After saving: the settings that changed and need a restart of `trofeo_lcd`.
+    restart_notice: Option<Vec<String>>,
+    /// "Import a design": the pasted text and what happened.
+    import_text: String,
+    import_msg: Option<(String, bool)>,
+    /// "Your themes": the name being typed, and what happened.
+    theme_name: String,
+    theme_msg: Option<(String, bool)>,
+    /// "Profiles": the name and text being edited, and what happened.
+    prof_name: String,
+    prof_text: String,
+    prof_msg: Option<(String, bool)>,
+    /// The visual builder of free layouts.
+    builder: builder::Builder,
+}
+
+/// The "Share your design" section: the picture taken and what is going on.
+#[derive(Default)]
+struct ShareState {
+    png: Option<PathBuf>,
+    tex: Option<egui::TextureHandle>,
+    /// A screenshot was asked of the running program: (when, the file it should write).
+    waiting: Option<(Instant, PathBuf)>,
+    message: Option<(String, bool)>,
+}
+
+/// Reads a PNG into a texture.
+fn load_png_texture(ctx: &egui::Context, path: &Path) -> Result<egui::TextureHandle, String> {
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    let img = image::load_from_memory(&bytes).map_err(|e| e.to_string())?.to_rgba8();
+    let size = [img.width() as usize, img.height() as usize];
+    Ok(ctx.load_texture("share", egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw()), egui::TextureOptions::LINEAR))
 }
 
 fn default_path() -> PathBuf {
@@ -1246,9 +1327,22 @@ impl App {
             hwinfo_search: String::new(),
             hwinfo_options: Err("Editor initialization incomplete".into()),
             sensor_editor_only: false,
+            share: ShareState::default(),
+            query: String::new(),
+            only_changed: false,
+            open_cat: None,
+            restart_notice: None,
+            import_text: String::new(),
+            import_msg: None,
+            theme_name: String::new(),
+            theme_msg: None,
+            prof_name: String::new(),
+            prof_text: String::new(),
+            prof_msg: None,
+            builder: builder::Builder::new(),
         };
         app.load(&path);
-        app.hwinfo_options = trofeo_lcd::config::ConfigFile::parse(&app.ed.doc.to_text())
+        app.hwinfo_options = trofeo_lcd::config::ConfigFile::parse_raw(&app.ed.doc.to_text())
             .and_then(|f| trofeo_lcd::hwinfo_provider::Options::from_config(&f));
         app
     }
@@ -1311,6 +1405,15 @@ impl App {
         let res = std::fs::write(&tmp, &text).and_then(|_| std::fs::rename(&tmp, path));
         match res {
             Ok(()) => {
+                // settings that changed and only apply after a restart of the program
+                let old = ConfDoc::parse(&self.saved_text);
+                let need: Vec<String> = self
+                    .fields
+                    .iter()
+                    .filter(|f| f.restart && old.get(&f.key) != self.ed.doc.get(&f.key))
+                    .map(|f| label(f, l).to_string())
+                    .collect();
+                self.restart_notice = (!need.is_empty()).then_some(need);
                 self.saved_text = text;
                 self.path = path.to_path_buf();
                 self.path_text = path.display().to_string();
@@ -1381,7 +1484,7 @@ impl App {
                 let secs = if self.animate { self.anim_start.elapsed().as_secs_f64() } else { 4.0 };
                 let ctx2 = ctx.clone();
                 std::thread::spawn(move || {
-                    let r = render_preview(&exe, &text, &workdir, state, layout, secs);
+                    let r = render_preview(&exe, &text, &workdir, state, layout, secs, None);
                     let _ = tx.send(r);
                     ctx2.request_repaint();
                 });
@@ -1399,6 +1502,8 @@ impl App {
         self.preview.exe = None;
         self.screenshot = None;
         self.section = "lhm".into();
+        self.query.clear();
+        self.only_changed = false;
     }
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         if self.sensor_editor_only {
@@ -1536,16 +1641,62 @@ impl App {
         if self.sensor_editor_only { ui.label("Sensor sources"); return; }
         let l = self.lang;
         ui.add_space(4.0);
-        for (id, en, it) in schema::SECTIONS {
-            let n_set = self.fields.iter().filter(|f| f.section == *id && self.ed.doc.is_set(&f.key)).count();
-            let text = if n_set > 0 { format!("{}  ({n_set})", tr(l, en, it)) } else { tr(l, en, it).to_string() };
-            if ui.selectable_label(self.section == *id, text).clicked() {
-                self.section = id.to_string();
+        ui.horizontal(|ui| {
+            ui.add(egui::TextEdit::singleline(&mut self.query).hint_text(tr(l, "Search settings...", "Cerca impostazioni...")).desired_width(150.0));
+            if !self.query.is_empty() && ui.small_button("x").on_hover_text(tr(l, "Clear the search", "Cancella la ricerca")).clicked() {
+                self.query.clear();
             }
+        });
+        let n_changed = self.fields.iter().filter(|f| self.ed.doc.is_set(&f.key)).count();
+        let searching = !self.query.trim().is_empty();
+        if ui
+            .selectable_label(self.only_changed && !searching, format!("{}  ({n_changed})", tr(l, "Settings I changed", "Impostazioni che ho cambiato")))
+            .on_hover_text(tr(l, "Only the settings that are written in the file", "Solo le impostazioni scritte nel file"))
+            .clicked()
+        {
+            self.only_changed = !self.only_changed;
+            self.query.clear();
         }
         ui.separator();
-        if ui.selectable_label(self.section == "raw", tr(l, "Raw file", "File grezzo")).clicked() {
+        let force = self.open_cat.take();
+        let browsing = !searching && !self.only_changed;
+        let mut picked: Option<String> = None;
+        for (ci, (cen, cit, ids)) in schema::CATEGORIES.iter().enumerate() {
+            let section_text = |id: &str, ed: &Ed, fields: &[Field]| {
+                let (en, it) = schema::SECTIONS.iter().find(|(s, _, _)| *s == id).map(|(_, en, it)| (*en, *it)).unwrap_or((id, id));
+                let n_set = fields.iter().filter(|f| f.section == id && ed.doc.is_set(&f.key)).count();
+                if n_set > 0 { format!("{}  ({n_set})", tr(l, en, it)) } else { tr(l, en, it).to_string() }
+            };
+            if ids.len() == 1 {
+                let id = ids[0];
+                if ui.selectable_label(browsing && self.section == id, section_text(id, &self.ed, &self.fields)).clicked() {
+                    picked = Some(id.to_string());
+                }
+                continue;
+            }
+            let current = ids.contains(&self.section.as_str());
+            let mut header = egui::CollapsingHeader::new(RichText::new(tr(l, cen, cit)).strong()).id_salt(("category", ci)).default_open(current);
+            if force == Some(ci) {
+                header = header.open(Some(true));
+            }
+            header.show(ui, |ui| {
+                for id in ids.iter() {
+                    if ui.selectable_label(browsing && self.section == *id, section_text(id, &self.ed, &self.fields)).clicked() {
+                        picked = Some(id.to_string());
+                    }
+                }
+            });
+        }
+        if let Some(id) = picked {
+            self.section = id;
+            self.query.clear();
+            self.only_changed = false;
+        }
+        ui.separator();
+        if ui.selectable_label(self.section == "raw" && browsing, tr(l, "Raw file", "File grezzo")).clicked() {
             self.section = "raw".to_string();
+            self.query.clear();
+            self.only_changed = false;
             self.raw_text = None;
         }
         ui.add_space(8.0);
@@ -1616,8 +1767,505 @@ impl App {
             }
         });
     }
+    /// A list of settings from different sections (the search, the changed ones), each editable
+    /// in place, under the name of its section.
+    fn fields_list(&mut self, ui: &mut egui::Ui, heading: String, hint: String, list: Vec<Field>) {
+        let l = self.lang;
+        ui.heading(heading);
+        if !hint.is_empty() {
+            ui.label(RichText::new(hint).weak());
+        }
+        ui.add_space(4.0);
+        let mut jump: Option<String> = None;
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            let mut last = "";
+            for f in &list {
+                if f.section != last {
+                    last = f.section;
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let name = schema::SECTIONS.iter().find(|(id, _, _)| *id == f.section).map(|(_, en, it)| tr(l, en, it)).unwrap_or("");
+                        ui.label(RichText::new(name).strong().color(Color32::from_rgb(140, 190, 255)));
+                        if ui.small_button(tr(l, "go to the section", "vai alla sezione")).clicked() {
+                            jump = Some(f.section.to_string());
+                        }
+                    });
+                    ui.separator();
+                }
+                if let Some((k, vals)) = f.when {
+                    let cur = self.ed.value_of(k, &self.fields);
+                    if !vals.iter().any(|v| cur.eq_ignore_ascii_case(v)) {
+                        ui.label(RichText::new(format!("{} {k} = {}", tr(l, "Used only when", "Vale solo se"), vals.join(" / "))).weak().small());
+                    }
+                }
+                field_row(ui, &mut self.ed, f, l);
+            }
+        });
+        if let Some(id) = jump {
+            self.open_cat = schema::category_of(&id);
+            self.section = id;
+            self.query.clear();
+            self.only_changed = false;
+        }
+    }
+
+    fn search_form(&mut self, ui: &mut egui::Ui) {
+        let l = self.lang;
+        let mut hits: Vec<Field> = schema::search(&self.fields, &self.query).into_iter().cloned().collect();
+        let n = hits.len();
+        hits.truncate(60);
+        // keep the order of the sections of the editor, within them the best matches first
+        let order = |s: &str| schema::SECTIONS.iter().position(|(id, _, _)| *id == s).unwrap_or(usize::MAX);
+        hits.sort_by_key(|f| order(f.section));
+        let heading = format!("{}: \"{}\"", tr(l, "Search", "Ricerca"), self.query.trim());
+        let hint = if n == 0 {
+            tr(l, "Nothing found. Try another word (for example a color, a size, or the name of a screen).", "Nessun risultato. Prova un'altra parola (per esempio un colore, una dimensione o il nome di una schermata).").to_string()
+        } else if n > 60 {
+            format!("{n} {}", tr(l, "settings found, the first 60 are shown: add a word to narrow it down.", "impostazioni trovate, ne mostro 60: aggiungi una parola per restringere."))
+        } else {
+            format!("{n} {}", tr(l, "settings found. You can change them here.", "impostazioni trovate. Le puoi modificare qui."))
+        };
+        self.fields_list(ui, heading, hint, hits);
+    }
+
+    fn changed_form(&mut self, ui: &mut egui::Ui) {
+        let l = self.lang;
+        let list: Vec<Field> = self.fields.iter().filter(|f| self.ed.doc.is_set(&f.key)).cloned().collect();
+        let hint = if list.is_empty() {
+            tr(l, "Nothing is set yet: everything is at its default.", "Non hai ancora cambiato niente: tutto è ai valori predefiniti.").to_string()
+        } else {
+            tr(l, "The settings written in your file. The x puts one back to its default.", "Le impostazioni scritte nel tuo file. La x ne riporta una al valore predefinito.").to_string()
+        };
+        self.fields_list(ui, tr(l, "Settings I changed", "Impostazioni che ho cambiato").to_string(), hint, list);
+    }
+
+    /// "Share your design": a picture of the screen, the settings of the look, and the GitHub page.
+    fn share_form(&mut self, ui: &mut egui::Ui) {
+        let l = self.lang;
+        let dir = self.path.parent().map(Path::to_path_buf).unwrap_or_default();
+        ui.heading(tr(l, "Share your design", "Condividi il tuo design"));
+        ui.add_space(4.0);
+        ui.label(tr(
+            l,
+            "Show your screen in the project's gallery on GitHub (you need a GitHub account). Take a picture of what is on the screen now, check it, copy the settings that make up the look, and drop both in the page that opens. Nothing is sent from here: you are the one who posts it.",
+            "Mostra il tuo schermo nella galleria del progetto su GitHub (serve un account GitHub). Fai una foto di quello che c'è ora sullo schermo, controllala, copia le impostazioni che compongono l'aspetto e trascina il tutto nella pagina che si apre. Da qui non parte niente: la pubblicazione la fai tu.",
+        ));
+        ui.add_space(4.0);
+        ui.colored_label(
+            Color32::from_rgb(255, 190, 90),
+            tr(
+                l,
+                "The picture is public. Look at it before posting: the title of the song playing, the name of a game, the city of the weather or other names may be on the screen. The preview of this editor uses made-up values instead.",
+                "L'immagine è pubblica. Guardala prima di pubblicare: sullo schermo possono esserci il titolo del brano in riproduzione, il nome di un gioco, la città del meteo o altri nomi. L'anteprima di questo editor usa invece valori inventati.",
+            ),
+        );
+        ui.add_space(8.0);
+        // a screenshot that was asked of the running program
+        if let Some((since, png)) = self.share.waiting.clone() {
+            if !share::request_path(&dir).exists() && png.exists() {
+                match load_png_texture(ui.ctx(), &png) {
+                    Ok(t) => {
+                        self.share.tex = Some(t);
+                        self.share.png = Some(png);
+                        self.share.message = Some((tr(l, "Done. Look at the picture below.", "Fatto. Guarda l'immagine qui sotto.").to_string(), false));
+                    }
+                    Err(e) => self.share.message = Some((e, true)),
+                }
+                self.share.waiting = None;
+            } else if since.elapsed() > Duration::from_secs(6) {
+                let _ = std::fs::remove_file(share::request_path(&dir));
+                self.share.waiting = None;
+                self.share.message = Some((
+                    tr(
+                        l,
+                        "The program did not answer. trofeo_lcd must be running with this same configuration file (and be version 2.17 or newer).",
+                        "Il programma non ha risposto. trofeo_lcd deve essere in esecuzione con questo stesso file di configurazione (e dalla versione 2.17 in poi).",
+                    )
+                    .to_string(),
+                    true,
+                ));
+            } else {
+                ui.ctx().request_repaint_after(Duration::from_millis(200));
+            }
+        }
+        ui.horizontal_wrapped(|ui| {
+            let busy = self.share.waiting.is_some();
+            if ui.add_enabled(!busy, egui::Button::new(tr(l, "Take a picture of my screen", "Fai una foto del mio schermo"))).clicked() {
+                let png = share::gallery_dir(&dir).join(share::png_name());
+                match share::write_request(&dir, &png) {
+                    Ok(()) => {
+                        self.share.waiting = Some((Instant::now(), png));
+                        self.share.message = None;
+                    }
+                    Err(e) => self.share.message = Some((format!("{e}"), true)),
+                }
+            }
+            let can_preview = self.preview.exe.is_some();
+            if ui
+                .add_enabled(can_preview && !busy, egui::Button::new(tr(l, "Use the preview instead", "Usa invece l'anteprima")))
+                .on_hover_text(tr(l, "Made-up values: nothing personal on it", "Valori inventati: niente di personale"))
+                .clicked()
+            {
+                if let Some(exe) = self.preview.exe.clone() {
+                    let png = share::gallery_dir(&dir).join(share::png_name());
+                    match render_preview(&exe, &self.ed.doc.to_text(), &dir, self.state, self.layout_idx, 4.0, Some(&png)) {
+                        Ok(_) => match load_png_texture(ui.ctx(), &png) {
+                            Ok(t) => {
+                                self.share.tex = Some(t);
+                                self.share.png = Some(png);
+                                self.share.message = Some((tr(l, "Done. Look at the picture below.", "Fatto. Guarda l'immagine qui sotto.").to_string(), false));
+                            }
+                            Err(e) => self.share.message = Some((e, true)),
+                        },
+                        Err(e) => self.share.message = Some((e, true)),
+                    }
+                }
+            }
+            if busy {
+                ui.label(RichText::new(tr(l, "waiting for the program...", "in attesa del programma...")).weak());
+            }
+        });
+        if let Some((m, err)) = &self.share.message {
+            ui.colored_label(if *err { Color32::from_rgb(255, 120, 120) } else { Color32::from_rgb(120, 220, 140) }, m);
+        }
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            if let Some(t) = &self.share.tex {
+                let sz = t.size_vec2();
+                let scale = (ui.available_width() / sz.x).min(1.0).max(0.05);
+                ui.add_space(6.0);
+                ui.add(egui::Image::new(egui::load::SizedTexture::new(t.id(), sz * scale)).rounding(4.0));
+            }
+            if let Some(png) = self.share.png.clone() {
+                ui.add_space(8.0);
+                ui.label(RichText::new(tr(l, "Settings of the look", "Impostazioni dell'aspetto")).strong().color(Color32::from_rgb(140, 190, 255)));
+                ui.separator();
+                ui.label(RichText::new(tr(
+                    l,
+                    "Only what you changed in the look of the screens. No files, folders, city, sensors or system settings.",
+                    "Solo quello che hai cambiato nell'aspetto delle schermate. Niente file, cartelle, città, sensori o impostazioni di sistema.",
+                )).weak().small());
+                let text = share::settings_text(&self.ed.doc, &self.fields);
+                let mut shown = if text.is_empty() { tr(l, "(everything is at its default)", "(tutto è ai valori predefiniti)").to_string() } else { text.clone() };
+                ui.add(egui::TextEdit::multiline(&mut shown).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY).desired_rows(6));
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button(tr(l, "Copy the settings", "Copia le impostazioni")).clicked() {
+                        ui.ctx().copy_text(text.clone());
+                        self.share.message = Some((tr(l, "Copied. Paste them (Ctrl+V) in the page.", "Copiate. Incollale (Ctrl+V) nella pagina.").to_string(), false));
+                    }
+                    if ui
+                        .button(tr(l, "Save my look as a theme file to attach", "Salva il mio aspetto come file di tema da allegare"))
+                        .on_hover_text(tr(l, "Writes name.theme.txt next to the picture; drag it into the page too (name taken from the box in Your themes, below)", "Scrive nome.theme.txt accanto all'immagine; trascinalo anche nella pagina (il nome è quello della casella in I tuoi temi, qui sotto)"))
+                        .clicked()
+                    {
+                        let name = if self.theme_name.trim().is_empty() { "my-look".to_string() } else { self.theme_name.trim().to_string() };
+                        let pairs = share::look_pairs(&self.ed.doc, &self.fields, Some(&dir.join(trofeo_lcd::themes::FOLDER)), true);
+                        let out_dir = png.parent().map(Path::to_path_buf).unwrap_or_else(|| dir.clone());
+                        let file = out_dir.join(trofeo_lcd::themes::export_file_name(&name));
+                        let r = trofeo_lcd::themes::valid_name(&name)
+                            .map_err(|e| format!("'{name}': {e}"))
+                            .and_then(|()| if pairs.is_empty() { Err("there is nothing to save: every setting of the look is at its default".to_string()) } else { Ok(()) })
+                            .and_then(|()| std::fs::write(&file, trofeo_lcd::themes::render(&name, &pairs)).map_err(|e| format!("cannot write {}: {e}", file.display())));
+                        self.share.message = Some(match r {
+                            Ok(()) => (format!("{} {}", tr(l, "Theme file saved:", "File di tema salvato:"), file.display()), false),
+                            Err(e) => (e, true),
+                        });
+                    }
+                    if ui.button(tr(l, "Open the folder with the picture", "Apri la cartella con l'immagine")).clicked() {
+                        if let Some(d) = png.parent() {
+                            share::open(&d.to_string_lossy());
+                        }
+                    }
+                    if ui.button(tr(l, "Open the GitHub page", "Apri la pagina di GitHub")).clicked() {
+                        share::open(&share::issue_url(env!("CARGO_PKG_VERSION")));
+                    }
+                });
+                ui.add_space(4.0);
+                ui.label(RichText::new(tr(
+                    l,
+                    "In the page: drag the picture file into the box for the picture, paste the settings in the box for the settings (or drag the theme file into the box for it), then send.",
+                    "Nella pagina: trascina il file dell'immagine nella casella dell'immagine, incolla le impostazioni nella casella delle impostazioni (o trascina il file di tema nella sua casella), poi invia.",
+                )).weak());
+            }
+            ui.add_space(10.0);
+            if ui.link(tr(l, "See the gallery of the other users", "Guarda la galleria degli altri utenti")).clicked() {
+                share::open(share::GALLERY_LIST);
+            }
+            // ---- your own themes
+            ui.add_space(14.0);
+            self.themes_block(ui, &dir);
+            // ---- import a design from the gallery
+            ui.add_space(14.0);
+            ui.label(RichText::new(tr(l, "Import a design", "Importa un design")).strong().color(Color32::from_rgb(140, 190, 255)));
+            ui.separator();
+            ui.label(RichText::new(tr(
+                l,
+                "Paste the settings of a design from the gallery. Only the look is taken: files, folders, the weather city, the sensors and the system settings are never imported, and your own are left as they are. Nothing is saved until you press Save (Reload drops the changes).",
+                "Incolla le impostazioni di un design della galleria. Si prende solo l'aspetto: file, cartelle, città del meteo, sensori e impostazioni di sistema non vengono mai importati, e le tue restano come sono. Non viene salvato niente finché non premi Salva (Ricarica scarta le modifiche).",
+            )).weak().small());
+            ui.add(
+                egui::TextEdit::multiline(&mut self.import_text)
+                    .font(egui::TextStyle::Monospace)
+                    .hint_text("clock_format = 12h\nlayout = deck, cards")
+                    .desired_width(f32::INFINITY)
+                    .desired_rows(5),
+            );
+            ui.horizontal_wrapped(|ui| {
+                if ui.add_enabled(!self.import_text.trim().is_empty(), egui::Button::new(tr(l, "Import", "Importa"))).clicked() {
+                    let imp = share::parse_import(&self.import_text, &self.fields);
+                    for (k, v) in &imp.apply {
+                        self.ed.bufs.remove(k);
+                        self.ed.set(k, v);
+                    }
+                    let mut msg = format!("{} {}.", imp.apply.len(), tr(l, "settings imported", "impostazioni importate"));
+                    if !imp.skipped.is_empty() {
+                        let list: Vec<String> = imp.skipped.iter().map(|(k, why)| format!("{k} ({why})")).collect();
+                        msg.push_str(&format!(" {}: {}.", tr(l, "Left out", "Non importate"), list.join(", ")));
+                    }
+                    self.import_msg = Some((msg, imp.apply.is_empty()));
+                    if !imp.apply.is_empty() {
+                        self.import_text.clear();
+                    }
+                }
+                if ui.button(tr(l, "Clear", "Svuota")).clicked() {
+                    self.import_text.clear();
+                    self.import_msg = None;
+                }
+                if ui.button(tr(l, "Import a theme file...", "Importa un file di tema...")).clicked() {
+                    if let Some(file) = pick_file(tr(l, "Theme file", "File di tema"), None) {
+                        let name = file.file_name().and_then(|n| n.to_str()).and_then(trofeo_lcd::themes::name_from_file);
+                        self.import_msg = Some(match (std::fs::read_to_string(&file), name) {
+                            (Ok(text), Some(name)) => {
+                                let imp = share::parse_import(&text, &self.fields);
+                                match trofeo_lcd::themes::save_user(&dir_of(&self.path).join(trofeo_lcd::themes::FOLDER), &name, &imp.apply) {
+                                    Ok(_) => (format!("{} {name}  ({} {})", tr(l, "Theme saved:", "Tema salvato:"), imp.apply.len(), tr(l, "settings; use it with  theme = name", "impostazioni; usalo con  theme = nome")), false),
+                                    Err(e) => (e, true),
+                                }
+                            }
+                            (Err(e), _) => (format!("{}: {e}", file.display()), true),
+                            (_, None) => (tr(l, "The file name cannot be a theme name: rename the file, or paste its text and give a name.", "Il nome del file non può essere un nome di tema: rinomina il file, oppure incolla il testo e dagli un nome.").to_string(), true),
+                        });
+                    }
+                }
+                ui.separator();
+                ui.label(tr(l, "or save it as a theme named", "oppure salvalo come tema chiamato"));
+                ui.add(egui::TextEdit::singleline(&mut self.theme_name).desired_width(120.0).hint_text("my-theme"));
+                let can = !self.import_text.trim().is_empty() && !self.theme_name.trim().is_empty();
+                if ui.add_enabled(can, egui::Button::new(tr(l, "Import as a theme", "Importa come tema"))).clicked() {
+                    let imp = share::parse_import(&self.import_text, &self.fields);
+                    let r = trofeo_lcd::themes::save_user(&dir_of(&self.path).join(trofeo_lcd::themes::FOLDER), self.theme_name.trim(), &imp.apply);
+                    self.import_msg = Some(match r {
+                        Ok(p) => {
+                            let name = self.theme_name.trim().to_string();
+                            self.theme_name.clear();
+                            self.import_text.clear();
+                            (format!("{} {} ({}). {}", tr(l, "Theme saved:", "Tema salvato:"), name, p.display(), tr(l, "Use it with  theme = name  (Theme setting, Colors and text).", "Usalo con  theme = nome  (impostazione Tema, Colori e testo).")), false)
+                        }
+                        Err(e) => (e, true),
+                    });
+                }
+            });
+            if let Some((m, err)) = &self.import_msg {
+                ui.colored_label(if *err { Color32::from_rgb(255, 190, 90) } else { Color32::from_rgb(120, 220, 140) }, m);
+            }
+        });
+    }
+
+    /// "Profiles": the ones there are (use, edit, open) and a box to make or change one.
+    fn profiles_block(&mut self, ui: &mut egui::Ui) {
+        use trofeo_lcd::profiles as pf;
+        let l = self.lang;
+        let folder = dir_of(&self.path).join(pf::FOLDER);
+        ui.label(RichText::new(tr(l, "Your profiles", "I tuoi profili")).strong().color(Color32::from_rgb(140, 190, 255)));
+        ui.separator();
+        ui.label(RichText::new(tr(
+            l,
+            "A profile is a few settings that are laid over this file while it is in use, for example another layout and brightness for gaming. It is a text file in the profiles folder next to this file. Only settings that apply live can be in it. Choosing one here is saved in the profiles folder, not in this file, and trofeo_lcd follows within a second.",
+            "Un profilo è qualche impostazione che si sovrappone a questo file finché è in uso, per esempio un altro layout e un'altra luminosità per i giochi. È un file di testo nella cartella profiles accanto a questo file. Possono esserci solo impostazioni che valgono subito. La scelta fatta qui viene salvata nella cartella profiles, non in questo file, e trofeo_lcd la segue entro un secondo.",
+        )).weak().small());
+        let chosen = pf::read_active(&folder);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!(
+                "{} {}",
+                tr(l, "Chosen by hand:", "Scelto a mano:"),
+                chosen.clone().unwrap_or_else(|| tr(l, "(nothing: the file decides)", "(niente: decide il file)").to_string())
+            ));
+            if ui.small_button(tr(l, "No profile", "Nessun profilo")).clicked() {
+                self.prof_msg = Some(match pf::write_active(&folder, None) {
+                    Ok(()) => (tr(l, "No profile.", "Nessun profilo.").to_string(), false),
+                    Err(e) => (e.to_string(), true),
+                });
+            }
+            if chosen.is_some() && ui.small_button(tr(l, "Let the file decide", "Lascia decidere il file")).clicked() {
+                let _ = std::fs::remove_file(folder.join(pf::ACTIVE_FILE));
+            }
+        });
+        let mut message: Option<(String, bool)> = None;
+        let mut edit: Option<String> = None;
+        for name in pf::list(&folder) {
+            ui.horizontal_wrapped(|ui| {
+                let on = chosen.as_deref() == Some(name.as_str());
+                ui.label(RichText::new(format!("{}{name}", if on { "\u{25B6} " } else { "" })).monospace());
+                if ui.small_button(tr(l, "Use", "Usa")).clicked() {
+                    message = Some(match pf::write_active(&folder, Some(&name)) {
+                        Ok(()) => (format!("{} {name}", tr(l, "In use:", "In uso:")), false),
+                        Err(e) => (e.to_string(), true),
+                    });
+                }
+                if ui.small_button(tr(l, "Edit", "Modifica")).clicked() {
+                    edit = Some(name.clone());
+                }
+                if ui.small_button(tr(l, "Open the file", "Apri il file")).clicked() {
+                    share::open(&pf::path_of(&folder, &name).to_string_lossy());
+                }
+            });
+        }
+        if let Some(n) = edit {
+            match std::fs::read_to_string(pf::path_of(&folder, &n)) {
+                Ok(t) => {
+                    self.prof_name = n;
+                    self.prof_text = t;
+                }
+                Err(e) => message = Some((e.to_string(), true)),
+            }
+        }
+        if message.is_some() {
+            self.prof_msg = message;
+        }
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(tr(l, "Name", "Nome"));
+            ui.add(egui::TextEdit::singleline(&mut self.prof_name).desired_width(140.0).hint_text("gaming"));
+            if ui.button(tr(l, "Fill with the settings I changed", "Riempi con le impostazioni che ho cambiato")).clicked() {
+                // the settings written in the file now, that a profile may carry
+                let all = &self.fields;
+                let text: String = all
+                    .iter()
+                    .filter(|f| !f.restart && !f.key.starts_with("profile") && self.ed.doc.is_set(&f.key) && schema::check_value(f, &self.ed.doc.get(&f.key).unwrap_or_default()) && f.section != "share")
+                    .filter_map(|f| self.ed.doc.get(&f.key).map(|v| format!("{} = {}\n", f.key, v)))
+                    .collect();
+                self.prof_text = text;
+            }
+        });
+        ui.add(
+            egui::TextEdit::multiline(&mut self.prof_text)
+                .font(egui::TextStyle::Monospace)
+                .hint_text("layout = gaming\nbrightness = 100")
+                .desired_width(f32::INFINITY)
+                .desired_rows(6),
+        );
+        ui.horizontal(|ui| {
+            let can = !self.prof_name.trim().is_empty() && !self.prof_text.trim().is_empty();
+            if ui.add_enabled(can, egui::Button::new(tr(l, "Save the profile", "Salva il profilo"))).clicked() {
+                self.prof_msg = Some(match pf::save_text(&folder, self.prof_name.trim(), &self.prof_text) {
+                    Ok(p) => (format!("{} {}", tr(l, "Saved:", "Salvato:"), p.display()), false),
+                    Err(e) => (e, true),
+                });
+            }
+            if folder.is_dir() && ui.button(tr(l, "Open the profiles folder", "Apri la cartella dei profili")).clicked() {
+                share::open(&folder.to_string_lossy());
+            }
+        });
+        if let Some((m, err)) = &self.prof_msg {
+            ui.colored_label(if *err { Color32::from_rgb(255, 190, 90) } else { Color32::from_rgb(120, 220, 140) }, m);
+        }
+    }
+
+    /// "Your themes": save the look as a theme, export it, use or open the ones saved.
+    fn themes_block(&mut self, ui: &mut egui::Ui, dir: &Path) {
+        use trofeo_lcd::themes as th;
+        let l = self.lang;
+        let folder = dir.join(th::FOLDER);
+        ui.label(RichText::new(tr(l, "Your themes", "I tuoi temi")).strong().color(Color32::from_rgb(140, 190, 255)));
+        ui.separator();
+        ui.label(RichText::new(tr(
+            l,
+            "Save the look you have made as a theme: a small text file in the themes folder next to your configuration file. Then `theme = name` brings it back, and the file (or its text) can be given to anyone, who saves it in the same folder. Only the look is in it: no files, folders, city, sensors or system settings.",
+            "Salva l'aspetto che hai creato come tema: un piccolo file di testo nella cartella themes accanto al tuo file di configurazione. Poi `theme = nome` lo richiama, e il file (o il suo testo) si può dare a chiunque, che lo salva nella stessa cartella. C'è solo l'aspetto: niente file, cartelle, città, sensori o impostazioni di sistema.",
+        )).weak().small());
+        ui.horizontal_wrapped(|ui| {
+            ui.label(tr(l, "Name", "Nome"));
+            ui.add(egui::TextEdit::singleline(&mut self.theme_name).desired_width(140.0).hint_text("my-theme"));
+            if ui.add_enabled(!self.theme_name.trim().is_empty(), egui::Button::new(tr(l, "Save my look as a theme", "Salva il mio aspetto come tema"))).clicked() {
+                let pairs = share::look_pairs(&self.ed.doc, &self.fields, Some(&folder), true);
+                self.theme_msg = Some(match th::save_user(&folder, self.theme_name.trim(), &pairs) {
+                    Ok(p) => {
+                        let name = self.theme_name.trim().to_string();
+                        self.theme_name.clear();
+                        (format!("{} {name} ({}).", tr(l, "Saved:", "Salvato:"), p.display()), false)
+                    }
+                    Err(e) => (e, true),
+                });
+            }
+        });
+        if let Some((m, err)) = &self.theme_msg {
+            ui.colored_label(if *err { Color32::from_rgb(255, 190, 90) } else { Color32::from_rgb(120, 220, 140) }, m);
+        }
+        let own = th::list_user(&folder);
+        if own.is_empty() {
+            ui.label(RichText::new(tr(l, "(no theme of your own yet)", "(ancora nessun tuo tema)")).weak());
+        }
+        let mut message: Option<(String, bool)> = None;
+        for name in own {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(&name).monospace());
+                if ui.small_button(tr(l, "Use", "Usa")).on_hover_text("theme = name").clicked() {
+                    self.ed.bufs.remove("theme");
+                    self.ed.set("theme", &name);
+                    message = Some((format!("theme = {name}"), false));
+                }
+                if ui.small_button(tr(l, "Copy the text", "Copia il testo")).clicked() {
+                    match th::load_user(&folder, &name) {
+                        Ok(s) => {
+                            ui.ctx().copy_text(th::render(&name, &s));
+                            message = Some((tr(l, "Copied. Paste it in a message; the other person pastes it in Import a design, with a name.", "Copiato. Incollalo in un messaggio; l'altra persona lo incolla in Importa un design, con un nome.").to_string(), false));
+                        }
+                        Err(e) => message = Some((e, true)),
+                    }
+                }
+                if ui.small_button(tr(l, "Open the file", "Apri il file")).clicked() {
+                    share::open(&th::path_of(&folder, &name).to_string_lossy());
+                }
+            });
+        }
+        if message.is_some() {
+            self.theme_msg = message;
+        }
+        if folder.is_dir() && ui.small_button(tr(l, "Open the themes folder", "Apri la cartella dei temi")).clicked() {
+            share::open(&folder.to_string_lossy());
+        }
+    }
+
     fn form(&mut self, ui: &mut egui::Ui) {
         let l = self.lang;
+        if !self.query.trim().is_empty() {
+            self.search_form(ui);
+            return;
+        }
+        if self.only_changed {
+            self.changed_form(ui);
+            return;
+        }
+        if self.section == "share" {
+            self.share_form(ui);
+            return;
+        }
+        if self.section == "builder" {
+            let names = self.layout_names();
+            let cx = builder::Ctx {
+                lang: l,
+                config_dir: dir_of(&self.path),
+                exe: self.preview.exe.clone(),
+                doc_text: self.ed.doc.to_text(),
+                in_screens: names.iter().any(|n| n == self.builder.current()),
+            };
+            if let builder::Out::AddToScreens(name) = self.builder.ui(ui, &cx) {
+                let mut entries = parse_layouts(&self.ed.get("layout").unwrap_or_default());
+                entries.push(LayoutEntry { name: name.clone(), secs: None });
+                self.ed.set("layout", &layouts_to_string(&entries));
+            }
+            return;
+        }
         if self.section == "raw" {
             let text = self.raw_text.get_or_insert_with(|| self.ed.doc.to_text());
             ui.label(RichText::new(tr(l, "The file as text. Edit freely; the changes apply as you type.", "Il file come testo. Modificalo liberamente; le modifiche valgono man mano che scrivi.")).weak());
@@ -1701,6 +2349,10 @@ impl App {
                     ui.add_space(8.0);
                 }
             }
+            if self.section == "profiles" {
+                ui.add_space(14.0);
+                self.profiles_block(ui);
+            }
         });
     }
 
@@ -1752,6 +2404,8 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.frames += 1;
+        trofeo_lcd::themes::set_user_dir(trofeo_lcd::themes::folder_of(&self.path));
+        trofeo_lcd::free::set_dir(trofeo_lcd::free::folder_of(&self.path));
         self.refresh_dirty();
         if ctx.input(|i| i.viewport().close_requested()) && self.dirty && !self.allow_close {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -1777,8 +2431,28 @@ impl eframe::App for App {
                 }
             });
         });
+        if let Some(list) = self.restart_notice.clone() {
+            egui::TopBottomPanel::bottom("restart").show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(
+                        Color32::from_rgb(255, 190, 90),
+                        format!(
+                            "{} {}",
+                            tr(self.lang, "Saved. These settings apply only after trofeo_lcd is restarted:", "Salvato. Queste impostazioni valgono solo dopo il riavvio di trofeo_lcd:"),
+                            list.join(", ")
+                        ),
+                    );
+                    if ui.small_button("OK").clicked() {
+                        self.restart_notice = None;
+                    }
+                });
+            });
+        }
         let portrait = self.preview.tex.as_ref().is_some_and(|t| t.size_vec2().y > t.size_vec2().x);
-        if portrait {
+        // (the builder page has the screen in it: the preview of the whole file is not wanted there)
+        if self.section == "builder" && self.query.trim().is_empty() && !self.only_changed {
+            // nothing
+        } else if portrait {
             egui::SidePanel::right("preview").resizable(true).default_width(300.0).show(ctx, |ui| self.preview_panel(ui, true));
         } else {
             egui::TopBottomPanel::top("preview").show(ctx, |ui| self.preview_panel(ui, false));
@@ -1820,12 +2494,15 @@ fn main() -> eframe::Result<()> {
     let (mut lang, mut section, mut shot): (Option<Lang>, _, _) = (None, None, None);
     let mut size = [1280.0f32, 860.0];
     let mut sensor_editor_only = false;
+    let (mut query, mut changed): (Option<String>, bool) = (None, false);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--sensor-editor-only" => sensor_editor_only = true,
             "--lang" => lang = Some(if it.next().is_some_and(|v| v.starts_with("en")) { Lang::En } else { Lang::It }),
             "--section" => section = it.next().cloned(),
+            "--query" => query = it.next().cloned(),
+            "--changed" => changed = true,
             "--screenshot" => shot = it.next().map(PathBuf::from),
             "--size" => {
                 if let Some((w, h)) = it.next().and_then(|v| v.split_once('x')) {
@@ -1860,7 +2537,10 @@ fn main() -> eframe::Result<()> {
             style.spacing.item_spacing = egui::vec2(8.0, 5.0);
             style.spacing.slider_width = 200.0;
             cc.egui_ctx.set_style(style);
-            let mut app=App::new(path.clone(), lang, section.clone(), shot.clone());
+            let mut app = App::new(path.clone(), lang, section.clone(), shot.clone());
+            // developer options, for screenshots of the window
+            app.query = query.clone().unwrap_or_default();
+            app.only_changed = changed;
             if sensor_editor_only { app.isolate_sensor_editor(); }
             Ok(Box::new(app))
         }),
@@ -2040,7 +2720,7 @@ mod hwinfo_persistence_tests {
         // Test-owned directory beside the test executable, never the user's config.
         let dir=std::env::current_exe().unwrap().parent().unwrap().join(format!("synthetic-editor-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
         std::fs::create_dir(&dir).unwrap();let path=dir.join("synthetic.conf");
-        let original="# preserved\nfuture_setting=keep\nsensor_source=hwinfo\n";
+        let original="# preserved\nfuture_setting=keep\ntheme=custom-look\nsensor_source=hwinfo\n";
         std::fs::write(&path,original).unwrap();
         let mut app=App::new(path.clone(),Lang::En,None,None);
         assert!(app.hwinfo_worker.is_none());assert!(app.preview.rx.is_none());
@@ -2076,7 +2756,10 @@ mod isolated_sensor_editor_tests {
     fn isolated_editor_cannot_schedule_lcd_preview_or_device_test() {
         let path=std::env::current_exe().unwrap().with_extension("synthetic-isolation.conf");
         let mut app=App::new(path,Lang::En,None,None);
+        app.query = "brightness".into();
+        app.only_changed = true;
         app.isolate_sensor_editor();
+        assert!(app.query.is_empty() && !app.only_changed);
         assert!(app.sensor_editor_only);assert!(app.preview.exe.is_none());assert!(app.screenshot.is_none());
         assert_eq!(app.section,"lhm");assert!(app.hwinfo_worker.is_none());
         // Even if discovery were changed later, the explicit guard stops scheduling.

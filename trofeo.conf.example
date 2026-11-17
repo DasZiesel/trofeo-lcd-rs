@@ -19,6 +19,7 @@ flip = false
 # which asks for the number and writes these values for you.
 # hid_mount = auto        # auto | 0 | 90 | 180 | 270: turns the picture for the way the panel is mounted
 # hid_header = raster     # raster | panel: size written in the frame header (JPEG screens)
+# hid_resend_ms = 0       # 0..1000: if the whole screen blinks, dims or goes blank between pictures, keep sending the last one every N ms, from a thread of its own (try 1). 0 = off
 # hid_rgb565 = auto       # auto | little | big: pixel byte order of the small 320x240 screens (RGB565)
 
 # --- Margins (pixels) --------------------------------------------------------
@@ -125,6 +126,12 @@ language = en
 # figure is used when it gives one. "trofeo_lcd --diag" prints both, and the busy engines.
 # gpu_usage_source = auto        # auto | windows (always the Windows counter, as before 2.7.1)
 
+# --- Tray icon ------------------------------------------------------------------
+# Windows: start minimised. The console window goes away as soon as the program runs and an
+# icon appears in the tray: a click shows / hides the window, the right button opens a menu
+# (show / hide, exit). Needs a restart. Same as the --start-in-tray flag.
+# start_in_tray = false
+
 # --- New version notice ----------------------------------------------------------
 # Off by default. When on, the program looks on GitHub at start-up (one small request, nothing about
 # your computer is sent, nothing is downloaded) and, if a newer version exists, shows a banner at the
@@ -138,6 +145,30 @@ language = en
 # 0-100 (100 = unchanged). The panel has no known brightness command:
 # the image is darkened in software before being sent.
 # brightness = 100
+# Night mode: dimmer between two times (the night may cross midnight). Off by default.
+# night_mode = false
+# night_start = 23:00
+# night_end = 07:00
+# night_brightness = 20      # 0-100; never brighter than "brightness"
+
+# Profiles: named sets of settings laid over this file while they are in use (for example another
+# layout and brightness for gaming). Each one is a text file profiles/<name>.profile next to this
+# file, with `key = value` lines; what it says wins over this file. Only settings that apply live.
+# The tray menu, the settings editor and the hotkey choose one by hand (saved in profiles/active).
+# profile = work              # the profile in use when none was chosen by hand
+# profile_key = ctrl+alt+p    # goes round the profiles (Windows; needs a restart)
+# profile_rules = mygame.exe=gaming, code.exe=work   # by the program in the foreground (Windows);
+#                                                    # goes back 5 seconds after leaving it
+
+# Alerts: a pulsing border and a bar with the value when a reading stays over its limit.
+# Every limit is 0 = off by default.
+# alert_cpu_temp = 90        # degrees C
+# alert_gpu_temp = 85
+# alert_cpu_load = 0         # percent
+# alert_gpu_load = 0         # games use the GPU fully: better left off
+# alert_ram = 95             # percent of memory used
+# alert_delay = 3            # seconds over the limit before it shows (a short spike is ignored)
+# alert_color = 255,40,40
 
 # --- DeepCool ----------------------------------------------------------------
 # false = the program does NOT touch the case's DeepCool display (stays off).
@@ -237,6 +268,12 @@ language = en
 # steam_bg_image = C:\Pictures\steam.jpg   # for image
 # steam_bg_dim = 0              # darken (0-100)
 # layout = cpu-gpu
+# A screen you designed yourself (the settings editor's Layout builder, or a text file
+# layouts/<name>.layout next to this file) is used by its name, like the others:
+# layout = default, my-screen
+# Five designs come with the program (no file needed; the layout builder can copy one to change):
+#   halo | gauges | terminal | horizon | ribbon
+# layout = halo
 # Rotation: several layouts separated by commas, changing every layout_interval seconds.
 # layout = cpu-gpu, temps, music
 # Each entry can set its OWN duration with "name:seconds", instead of sharing
@@ -279,7 +316,7 @@ language = en
 # --- Fans and sensors: LibreHardwareMonitor ------------------------------------------
 # Intel CPUs: the built-in CPU sensor reads AMD Ryzen only, so on Windows the CPU temperature and power of an
 # Intel CPU come from LibreHardwareMonitor too (start it as administrator, Options > Remote Web Server > Run).
-# "trofeo_lcd --diag" shows which CPU sensor the program found ("none" on Intel). See README: "Which sensors you need".
+# "trofeo_lcd --diag" shows which CPU sensor the program found ("none" on Intel). See docs/SENSORS.md ("Which sensors you need and what to install").
 # Fan speeds (and the motherboard / disk temperature) come from LibreHardwareMonitor:
 # start it AS ADMINISTRATOR, then Options > Remote Web Server > Run (port 8085) and leave it open.
 # Nothing happens when it is not running. "trofeo_lcd --lhm-list" shows what it reports and which
@@ -527,6 +564,21 @@ language = en
 # Units: network in KB/S (default), MB/S, or auto (KB below 1 MB/S, then MB); RAM in MB or GB
 # net_unit = mb
 # mem_unit = gb
+# Time format of every clock (big clock, status line, layouts, tiles, deck, gaming, music...):
+#   24h = 14:05 (default)    12h = 2:05 PM
+# Theme: a whole look in one line (background, colours, panel opacity). It only gives defaults:
+# anything you set yourself in this file wins over the theme.
+#   none | midnight | ocean | sunset | forest | ember | neon | matrix | mono
+#   or the name of a theme of your own: the file themes/<name>.theme next to this file (the settings
+#   editor, Share your design, saves your look as one and imports other people's)
+# theme = none
+# clock_format = 24h
+# clock_ampm = true           # 12h only: the AM / PM after the time
+# Fade between screens: when the screen changes (the layout rotation moves on, the music
+# screen or the gaming screen starts or ends) the old picture melts into the new one.
+# Length in milliseconds, 0..5000; 0 = off (a plain cut, default, costs nothing).
+# screen_fade_ms = 600
+# screen_fade_style = cross   # cross = dissolve | black = fade out to black, then fade in
 # Big clock (default screen): size of the time and date
 # clock_backdrop = true         # a panel behind the big clock
 # clock_time_size = 20        # 1..60
@@ -537,7 +589,7 @@ language = en
 # If the file has an error, the previous configuration stays valid and the reason is
 # written to trofeo-errors.txt (next to trofeo_lcd.exe).
 # Sensor sources, role assignments and HWiNFO timing also require a restart.
-# The other restart-only settings are deepcool, fps_monitor, openrgb, hide_console, screenshot_key, weather_city,
+# The other restart-only settings are deepcool, fps_monitor, openrgb, hide_console, start_in_tray, screenshot_key, weather_city,
 # ticker_source and ticker_refresh_min require a restart. weather_unit, the "weather"
 # show/hide/size/position/color/backdrop options, and ticker_position/ticker_size/
 # ticker_color/ticker_backdrop/ticker_width all apply live, like everything else.

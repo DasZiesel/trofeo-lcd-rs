@@ -406,9 +406,9 @@ fn draw_led(fb: &mut Framebuffer, area: (u32, u32, u32, u32), heights: &[f32], c
     let (left, top, w, sh) = area;
     let n = heights.len();
     let bw = bar_width(w, n);
-    let pitch = (sh / 24).max(4);
+    let pitch = (sh / 24).max(4).min(sh);
     let nseg = (sh / pitch).max(1);
-    let thick = pitch - 2;
+    let thick = pitch.saturating_sub(2).max(1);
     let bottom = top + sh;
     let mut x = left + GAP;
     for (i, &h) in heights.iter().enumerate() {
@@ -417,7 +417,7 @@ fn draw_led(fb: &mut Framebuffer, area: (u32, u32, u32, u32), heights: &[f32], c
             let level = (k as f32 + 0.5) / nseg as f32;
             let c = color(level, pos_of(i, n));
             let (r, g, b) = if k < lit { c } else { dim(c, 0.10) };
-            fb.fill_rect(x, bottom - (k + 1) * pitch + 2, bw, thick, r, g, b);
+            fb.fill_rect(x, bottom - (k + 1) * pitch + (pitch - thick), bw, thick, r, g, b);
         }
         x += bw + GAP;
     }

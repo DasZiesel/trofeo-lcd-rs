@@ -192,8 +192,44 @@ pub fn find(name: &str) -> Option<&'static LayoutDef> {
     LAYOUTS.iter().find(|l| l.name == n)
 }
 
+/// The screens of the free layouts that are in use: `free:<name>`, made once per name.
+static FREE_DEFS: std::sync::Mutex<Vec<&'static LayoutDef>> = std::sync::Mutex::new(Vec::new());
+
+/// Prefix of the name of a free layout's screen.
+pub const FREE_PREFIX: &str = "free:";
+
+/// A free layout (`layouts/<name>.layout`, see `free.rs`) as a screen, when the file exists or
+/// the name is one of the built-in designs.
+pub fn find_free(name: &str) -> Option<&'static LayoutDef> {
+    let n = name.trim().to_ascii_lowercase();
+    trofeo_lcd::free::valid_name(&n).ok()?;
+    let has_file = trofeo_lcd::free::dir().is_some_and(|d| trofeo_lcd::free::path_of(&d, &n).is_file());
+    if !has_file && trofeo_lcd::free::builtin(&n).is_none() {
+        return None;
+    }
+    let mut all = FREE_DEFS.lock().unwrap_or_else(|e| e.into_inner());
+    let full = format!("{FREE_PREFIX}{n}");
+    if let Some(d) = all.iter().find(|d| d.name == full) {
+        return Some(d);
+    }
+    let def: &'static LayoutDef = Box::leak(Box::new(LayoutDef {
+        name: Box::leak(full.into_boxed_str()),
+        description: "A free layout (built-in design or your own, layouts folder)",
+        standard: false,
+        cols: 1,
+        rows: &[],
+    }));
+    all.push(def);
+    Some(def)
+}
+
+/// A preset screen, or a free layout of yours.
+pub fn find_any(name: &str) -> Option<&'static LayoutDef> {
+    find(name).or_else(|| find_free(name))
+}
+
 pub fn names() -> String {
-    LAYOUTS.iter().map(|l| l.name).collect::<Vec<_>>().join(", ")
+    LAYOUTS.iter().map(|l| l.name).chain(trofeo_lcd::free::BUILTIN.iter().map(|b| b.0)).collect::<Vec<_>>().join(", ")
 }
 
 /// Point-in-time data for the widgets.
@@ -375,7 +411,7 @@ fn build_view(w: Widget, d: &WidgetData, color_mode: ColorMode) -> View {
         },
         Clock => View {
             label: i18n::weekday(&now),
-            value: now.format("%H:%M:%S").to_string(),
+            value: crate::fmt_clock(&now, true),
             detail: i18n::day_month_year(&now),
             gauge: None,
             value_color: opts().clock_color.or_else(|| Some(accent_color(color_mode))),

@@ -113,3 +113,13 @@ value. This is a display integration, not a safety monitor or fan controller.
 DeepCool forwarding is disabled for incompatible HWiNFO role configurations.
 The existing native/GPU paths remain separate, and native module code remains in
 the application binary even when HWiNFO is selected.
+
+## Profiles, themes and screen transitions
+
+Profiles cannot change restart-only sensor bindings or HWiNFO timing. Themes and
+shared designs exclude sensor settings. New free layouts and threshold alerts use
+the same projected readings as existing layouts; missing readings stay missing.
+The HWiNFO status footer is drawn after screen fades. A loss of usable data or a
+sensor generation change cancels the fade so an old sensor value is not retained
+by the transition. HID frame repetition is off by default and does not acquire
+or refresh sensors; it repeats the most recently rendered picture.
