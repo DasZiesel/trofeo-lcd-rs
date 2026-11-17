@@ -536,12 +536,16 @@ language = en
 # restarting (orientation, margins, background, language, colors, layouts, brightness, etc.).
 # If the file has an error, the previous configuration stays valid and the reason is
 # written to trofeo-errors.txt (next to trofeo_lcd.exe).
-# Only deepcool, fps_monitor, openrgb, hide_console, screenshot_key, weather_city,
+# Sensor sources, role assignments and HWiNFO timing also require a restart.
+# The other restart-only settings are deepcool, fps_monitor, openrgb, hide_console, screenshot_key, weather_city,
 # ticker_source and ticker_refresh_min require a restart. weather_unit, the "weather"
 # show/hide/size/position/color/backdrop options, and ticker_position/ticker_size/
 # ticker_color/ticker_backdrop/ticker_width all apply live, like everything else.
 
 # --- Sensor source and stable role assignments (restart required) ---
+# See HWINFO.md for setup, licensing, error states and known limits.
+# HWiNFO non-Pro Shared Memory is time limited; no automatic reactivation.
+# Set sensor_source = hwinfo to use HWiNFO as the default source.
 # Default auto preserves native/LHM acquisition and does not start HWiNFO.
 # HWiNFO requires a separately running Windows x64 HWiNFO with Shared Memory enabled.
 # Use the editor's explicit inventory button to choose compatible sensors.

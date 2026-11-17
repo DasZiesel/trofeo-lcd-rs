@@ -16,6 +16,15 @@ software is welcome and encouraged under the terms of that license — this
 file exists only to keep the provenance of the code clear, not to add any
 restriction beyond the GPL itself.
 
+## HWiNFO integration
+
+This feature branch adds an independently implemented Rust reader for the
+HWiNFO Shared Memory interface, sensor assignments and synthetic tests under
+the project license. HWiNFO remains separately installed and licensed. No
+HWiNFO binary, SDK, proprietary header or sample implementation is bundled.
+See [setup and limitations](HWINFO.md). Existing third-party notices remain
+applicable, including the [Poppins font license](assets/OFL.txt).
+
 ## What changed compared to upstream
 
 Starting from the `sukualam/trofeo-lcd` codebase, this fork has:

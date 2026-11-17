@@ -1,5 +1,8 @@
 # Options guide
 
+For `sensor_source`, `sensor_*` assignments and `hwinfo_*` timing settings, see
+[the HWiNFO guide](HWINFO.md). These settings require a restart.
+
 Every setting trofeo_lcd supports, in one place, with examples. For a shorter,
 inline-commented version you can copy and edit directly, see
 [`trofeo.conf.example`](./trofeo.conf.example).

@@ -1,4 +1,9 @@
 # trofeo_lcd
+
+**HWiNFO feature branch:** optional local Shared Memory sensor assignments on
+Windows x64. See [HWiNFO setup, timing, licensing and limitations](HWINFO.md).
+HWiNFO is installed separately; its non-Pro Shared Memory limit applies.
+
 ![overview](img/overview.png)
 ![overview2](img/overview2.jpeg)
 ![overview2](img/overview3.jpeg)
@@ -994,7 +999,7 @@ the screen to your list with one click).
 
 ### Live reload
 
-`trofeo.conf` is re-read every second; saved changes apply without restarting (a broken file is ignored and the previous settings stay). Only `deepcool`, `fps_monitor`, OpenRGB, `hide_console`, `screenshot_key`, `weather_city`, `ticker_source` and `ticker_refresh_min` need a restart. If a saved file is invalid, the previous settings stay active and the reason is written to `trofeo-errors.txt` next to the executable. The [settings editor](#settings-editor-trofeo_config) relies on this: save in the editor and the LCD updates by itself.
+`trofeo.conf` is re-read every second; saved changes apply without restarting (a broken file is ignored and the previous settings stay). Sensor sources, role assignments and HWiNFO timing require a restart (see [HWiNFO setup](HWINFO.md)). Other restart-only settings include `deepcool`, `fps_monitor`, OpenRGB, `hide_console`, `screenshot_key`, `weather_city`, `ticker_source` and `ticker_refresh_min`. If a saved file is invalid, the previous settings stay active and the reason is written to `trofeo-errors.txt` next to the executable. The [settings editor](#settings-editor-trofeo_config) relies on this: save in the editor and the LCD updates by itself.
 
 ### Per-item control
 
